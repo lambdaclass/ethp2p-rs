@@ -12,3 +12,7 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+prost = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }

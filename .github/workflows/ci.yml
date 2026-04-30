@@ -35,6 +35,19 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: check-protos
+        run: cargo xtask check-protos
+
       - name: rustfmt
         run: cargo fmt --all --check
 
