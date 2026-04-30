@@ -7,8 +7,13 @@
 
 pub mod chunk;
 pub mod selector;
+pub mod session;
 pub mod strategy;
 pub mod wire;
+
+pub use session::{Session, SessionError, SessionState, SessionWork};
+pub use strategy::dispatch::{ChunkDispatch, DispatchHandle};
+pub use strategy::{PeerId, Strategy, TakeError, TakeOutcome, Verdict};
 
 /// Generated protobuf module from the vendored `proto/broadcast.proto`
 /// and `proto/rs.proto`.
