@@ -1,0 +1,5 @@
+kind: SessOpen
+channel: example-channel
+message_id: msg-0001
+preamble_hex: deadbeef
+initial_update_hex: cafe

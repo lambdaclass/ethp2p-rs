@@ -1,8 +1,11 @@
 //! Foundational protocol types and codecs for ethp2p.
 //!
-//! This crate corresponds to the `protocol/` package in the upstream Go
-//! reference (`github.com/ethp2p/ethp2p`). It hosts the supporting types
-//! used by the broadcast layer and other future layers. Slice 1
-//! (`port-broadcast-codec`) populates this crate with the first concrete
-//! definitions, derived from `protocol/pb/protocol.proto` in the upstream
-//! spec.
+//! Hosts the generated protobuf module derived from the upstream
+//! `protocol/pb/protocol.proto` schema. The vendored copy at
+//! `proto/protocol.proto` is byte-identical to upstream and is verified
+//! by `cargo xtask check-protos`.
+
+#[allow(clippy::pedantic, clippy::all, missing_debug_implementations)]
+pub mod pb {
+    include!(concat!(env!("OUT_DIR"), "/ethp2p.protocol.rs"));
+}

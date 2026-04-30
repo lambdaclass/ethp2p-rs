@@ -16,6 +16,16 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/lambdaclass/ethp2p-rs"
 authors = ["LambdaClass <contact@lambdaclass.com>"]
 
+[workspace.dependencies]
+prost = "0.13"
+bytes = "1"
+tokio = { version = "1", default-features = false, features = ["io-util", "macros"] }
+prost-build = "0.13"
+sha2 = "0.10"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"
@@ -26,6 +36,7 @@ pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+multiple_crate_versions = "allow"
 
 [profile.release]
 lto = "thin"

@@ -1,0 +1,18 @@
+# Vendored protobuf schemas, with SHA-256 of the upstream source.
+# `cargo xtask check-protos` verifies that the vendored copies in this
+# repository remain byte-identical to upstream by comparing each file's
+# hash to the value recorded here.
+#
+# When upstream proto files change:
+#   1. Re-vendor the file (overwrite the local copy from upstream).
+#   2. Update the corresponding `sha256` below.
+#   3. Regenerate types via `cargo build`.
+#   4. Update the conformance corpus (`ETHP2P_REGEN_CODEC_CORPUS=1 cargo test ...`).
+
+[[proto]]
+path = "crates/ethp2p-protocol/proto/protocol.proto"
+sha256 = "1f703bf3173b4c1372585290c7ec4f92353c08c2265c8c82b7e5624f0a664982"
+
+[[proto]]
+path = "crates/ethp2p-broadcast/proto/broadcast.proto"
+sha256 = "2339e1fa03d6a5137a63e50fbe0c96132976448fad23dd857ae779f13da4f812"

@@ -1,6 +1,6 @@
 [package]
 name = "xtask"
-description = "Repository automation: protobuf regeneration, release helpers, etc. (skeleton)."
+description = "Repository automation: protobuf regeneration, release helpers, etc."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,3 +13,7 @@ publish = false
 workspace = true
 
 [dependencies]
+sha2 = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+toml = "0.8"

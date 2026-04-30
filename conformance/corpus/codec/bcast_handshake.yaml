@@ -1,0 +1,6 @@
+kind: BcastHandshake
+version: 1
+channels:
+  - a
+  - b
+peer_id: test-peer

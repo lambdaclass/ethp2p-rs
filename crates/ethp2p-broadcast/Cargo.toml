@@ -12,3 +12,16 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+ethp2p-protocol = { path = "../ethp2p-protocol" }
+prost = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "rt-multi-thread", "test-util"] }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+hex = { workspace = true }
