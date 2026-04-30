@@ -45,4 +45,26 @@ doc = false
 bench = false
 required-features = ["goref-shim"]
 
+[[bin]]
+name = "codec_decode_rs_preamble"
+path = "fuzz_targets/codec_decode_rs_preamble.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_decode_rs_chunk_ident"
+path = "fuzz_targets/codec_decode_rs_chunk_ident.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_rs_preamble_diff"
+path = "fuzz_targets/codec_rs_preamble_diff.rs"
+test = false
+doc = false
+bench = false
+required-features = ["goref-shim"]
+
 [workspace]

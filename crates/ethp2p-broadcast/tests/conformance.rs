@@ -11,7 +11,11 @@
 
 use std::path::{Path, PathBuf};
 
-use ethp2p_broadcast::pb::{bcast, chunk, sess, Bcast, Sess};
+use ethp2p_broadcast::pb::{
+    bcast, chunk,
+    rs::{ChunkIdent, Preamble as RsPreamblePb},
+    sess, Bcast, Sess,
+};
 use prost::Message;
 use serde::Deserialize;
 
@@ -34,6 +38,16 @@ enum CorpusEntry {
         message_id: String,
         chunk_id_hex: String,
         data_length: u32,
+    },
+    RsPreamble {
+        num_data: i32,
+        num_parity: i32,
+        length: i32,
+        hashes: Vec<String>,
+        hash: String,
+    },
+    RsChunkIdent {
+        index: i32,
     },
 }
 
@@ -89,6 +103,33 @@ impl CorpusEntry {
                 };
                 let mut out = Vec::with_capacity(header.encoded_len());
                 header.encode(&mut out).unwrap();
+                out
+            }
+            Self::RsPreamble {
+                num_data,
+                num_parity,
+                length,
+                hashes,
+                hash,
+            } => {
+                let preamble = RsPreamblePb {
+                    num_data: *num_data,
+                    num_parity: *num_parity,
+                    length: *length,
+                    hashes: hashes
+                        .iter()
+                        .map(|h| hex::decode(h).expect("hash entry is valid hex"))
+                        .collect(),
+                    hash: hex::decode(hash).expect("hash is valid hex"),
+                };
+                let mut out = Vec::with_capacity(preamble.encoded_len());
+                preamble.encode(&mut out).unwrap();
+                out
+            }
+            Self::RsChunkIdent { index } => {
+                let ci = ChunkIdent { index: *index };
+                let mut out = Vec::with_capacity(ci.encoded_len());
+                ci.encode(&mut out).unwrap();
                 out
             }
         }
