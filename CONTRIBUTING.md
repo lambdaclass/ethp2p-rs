@@ -54,6 +54,33 @@ spec alone could not have produced — request changes citing clean-room
 concern. The contributor either rewrites the affected portion or provides
 evidence the resemblance derives from the spec or from independent design.
 
+### Goref shim maintainer
+
+The current `fuzz/goref/` shim maintainer is **Pablo Deymonnaz**
+(`pablo.deymonnaz@lambdaclass.com`).
+
+Constraints on this role:
+
+- The maintainer may read upstream `**/*.go` files **only** as required
+  to implement the C ABI documented in `fuzz/goref/README.md`. The
+  shim is the single exception to clean-room.
+- The maintainer SHALL NOT author Rust code in crates that wrap the
+  same protocol surface their shim exposes. Today that means: while
+  serving as the broadcast-codec shim maintainer, no PRs touching
+  `crates/ethp2p-protocol/`, `crates/ethp2p-broadcast/`, or future
+  crates whose `pb` modules the shim wraps.
+- Rotation happens via PR against this file, naming the successor and
+  recording the transition date.
+
+**Reviewer checklist for shim PRs**: PRs to `fuzz/goref/` are reviewed
+to confirm the author is the named maintainer and that the changes
+match the FFI contract in `fuzz/goref/README.md`.
+
+**Reviewer checklist for protocol-touching PRs**: PRs to
+`crates/ethp2p-protocol/`, `crates/ethp2p-broadcast/`, and future
+codec/protocol crates are reviewed to confirm the author is NOT the
+named shim maintainer for that surface.
+
 ## License
 
 `ethp2p-rs` is dual-licensed under either of:
