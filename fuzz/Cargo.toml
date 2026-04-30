@@ -1,0 +1,48 @@
+[package]
+name = "ethp2p-fuzz"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.95"
+publish = false
+authors = ["LambdaClass <contact@lambdaclass.com>"]
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[features]
+goref-shim = []
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+prost = "0.13"
+ethp2p-protocol = { path = "../crates/ethp2p-protocol" }
+ethp2p-broadcast = { path = "../crates/ethp2p-broadcast" }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[[bin]]
+name = "codec_decode_bcast"
+path = "fuzz_targets/codec_decode_bcast.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_bcast_diff"
+path = "fuzz_targets/codec_bcast_diff.rs"
+test = false
+doc = false
+bench = false
+required-features = ["goref-shim"]
+
+[workspace]

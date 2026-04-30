@@ -59,3 +59,42 @@ jobs:
 
       - name: build
         run: cargo build --workspace
+
+  fuzz-smoke:
+    name: fuzz-smoke (ubuntu)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry and fuzz target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            fuzz/target
+          key: fuzz-ubuntu-${{ hashFiles('**/Cargo.lock', 'fuzz/Cargo.toml') }}
+          restore-keys: |
+            fuzz-ubuntu-
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: clippy (fuzz crate, default features)
+        working-directory: fuzz
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: fmt (fuzz crate)
+        working-directory: fuzz
+        run: cargo fmt --all --check
+
+      - name: Run sanity fuzz target (60s)
+        working-directory: fuzz
+        run: cargo fuzz run --sanitizer none codec_decode_bcast --release -- -max_total_time=60
