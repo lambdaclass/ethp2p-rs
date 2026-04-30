@@ -1,0 +1,14 @@
+[package]
+name = "ethp2p-protocol"
+description = "Foundational protocol types and codecs for ethp2p, derived from the upstream spec."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

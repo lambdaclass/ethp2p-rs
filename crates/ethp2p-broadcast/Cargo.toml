@@ -1,0 +1,14 @@
+[package]
+name = "ethp2p-broadcast"
+description = "Erasure-coded broadcast engine and pluggable strategies for ethp2p."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
