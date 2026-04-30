@@ -190,6 +190,29 @@ impl EmitPlanner {
         self.peers.entry(peer).or_default().optimistic_havelist = Some(b);
     }
 
+    /// Returns the indices currently in-flight to `peer`.
+    #[must_use]
+    pub fn peer_in_flight(&self, peer: PeerId) -> Vec<u32> {
+        self.peers
+            .get(&peer)
+            .map(|s| s.in_flight.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Returns a clone of the peer's optimistic havelist, if any.
+    #[must_use]
+    pub fn peer_havelist(&self, peer: PeerId) -> Option<BitMap> {
+        self.peers
+            .get(&peer)
+            .and_then(|s| s.optimistic_havelist.clone())
+    }
+
+    /// Total shard count this planner was constructed with.
+    #[must_use]
+    pub fn num_shards(&self) -> u32 {
+        self.num_shards
+    }
+
     /// Allocation count for a given shard (for tests and inspection).
     #[must_use]
     pub fn allocation_count(&self, idx: u32) -> u32 {

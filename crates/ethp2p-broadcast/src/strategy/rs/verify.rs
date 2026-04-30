@@ -96,9 +96,9 @@ pub fn validate_preamble(p: &Preamble) -> Result<(), PreambleError> {
 
 /// Verify a single chunk against the preamble.
 ///
-/// Returns [`Verdict::Reject`] for: out-of-range index, malformed
+/// Returns [`Verdict::Invalid`] for: out-of-range index, malformed
 /// preamble entry (non-32-byte hash), or hash mismatch. Returns
-/// [`Verdict::Accept`] only on a 32-byte hash match.
+/// [`Verdict::Accepted`] only on a 32-byte hash match.
 #[must_use]
 pub fn verify_chunk(preamble: &Preamble, idx: u32, data: &[u8]) -> Verdict {
     let Some(total) = u32::try_from(preamble.num_data)
@@ -106,20 +106,20 @@ pub fn verify_chunk(preamble: &Preamble, idx: u32, data: &[u8]) -> Verdict {
         .and_then(|d| u32::try_from(preamble.num_parity).ok().map(|p| (d, p)))
         .and_then(|(d, p)| d.checked_add(p))
     else {
-        return Verdict::Reject;
+        return Verdict::Invalid;
     };
     if idx >= total {
-        return Verdict::Reject;
+        return Verdict::Invalid;
     }
     let entry = match preamble.hashes.get(idx as usize) {
         Some(h) if h.len() == HASH_LEN => h,
-        _ => return Verdict::Reject,
+        _ => return Verdict::Invalid,
     };
     let computed = Sha256::digest(data);
     if computed.as_slice() == entry.as_slice() {
-        Verdict::Accept
+        Verdict::Accepted
     } else {
-        Verdict::Reject
+        Verdict::Invalid
     }
 }
 
@@ -171,7 +171,7 @@ mod tests {
     fn verify_chunk_accepts_valid() {
         let (p, shards) = encoded();
         for (i, s) in shards.iter().enumerate() {
-            assert_eq!(verify_chunk(&p, i as u32, s), Verdict::Accept);
+            assert_eq!(verify_chunk(&p, i as u32, s), Verdict::Accepted);
         }
     }
 
@@ -179,21 +179,21 @@ mod tests {
     fn verify_chunk_rejects_tampered() {
         let (p, mut shards) = encoded();
         shards[0][0] ^= 0x01;
-        assert_eq!(verify_chunk(&p, 0, &shards[0]), Verdict::Reject);
+        assert_eq!(verify_chunk(&p, 0, &shards[0]), Verdict::Invalid);
     }
 
     #[test]
     fn verify_chunk_rejects_out_of_range_index() {
         let (p, _) = encoded();
         let total = (p.num_data + p.num_parity) as u32;
-        assert_eq!(verify_chunk(&p, total, &[0; 0]), Verdict::Reject);
-        assert_eq!(verify_chunk(&p, total + 100, &[0; 0]), Verdict::Reject);
+        assert_eq!(verify_chunk(&p, total, &[0; 0]), Verdict::Invalid);
+        assert_eq!(verify_chunk(&p, total + 100, &[0; 0]), Verdict::Invalid);
     }
 
     #[test]
     fn verify_chunk_rejects_when_preamble_hash_entry_malformed() {
         let (mut p, shards) = encoded();
         p.hashes[0] = vec![0; 31];
-        assert_eq!(verify_chunk(&p, 0, &shards[0]), Verdict::Reject);
+        assert_eq!(verify_chunk(&p, 0, &shards[0]), Verdict::Invalid);
     }
 }
