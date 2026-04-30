@@ -12,7 +12,6 @@ conformance corpus with byte-level golden tests. Subsequent slices
 (engine, RS strategy, fuzz harness, transport) consume this codec as
 the contractual wire boundary; conformance to `port-charter` Requirement
 3 (wire-compatibility scope) is realized here.
-
 ## Requirements
 ### Requirement: Vendored protobuf schemas
 
@@ -21,26 +20,27 @@ The repository SHALL vendor the upstream protobuf schemas at
 byte-identical to their upstream counterparts at
 `github.com/ethp2p/ethp2p`. The build SHALL fail loudly on drift.
 
-For slice 1 the vendored set is:
+The vendored set is:
 
 - `crates/ethp2p-protocol/proto/protocol.proto` ← `protocol/pb/protocol.proto`
 - `crates/ethp2p-broadcast/proto/broadcast.proto` ← `broadcast/pb/broadcast.proto`
+- `crates/ethp2p-broadcast/proto/rs.proto` ← `broadcast/rs/pb/rs.proto`
 
 #### Scenario: Contributor updates a vendored proto without syncing
 
-- **WHEN** a contributor modifies `crates/ethp2p-broadcast/proto/broadcast.proto`
-  but the corresponding upstream file at `broadcast/pb/broadcast.proto`
-  is unchanged
-- **THEN** the `cargo xtask check-protos` step in CI fails with a diff
-  showing the divergence, and the PR is blocked from merging until the
-  vendored copy is reverted or an upstream PR lands first
+- **WHEN** a contributor modifies any vendored `*.proto` file but the
+  corresponding upstream file is unchanged
+- **THEN** the `cargo xtask check-protos` step in CI fails with a
+  diff showing the divergence, and the PR is blocked from merging
+  until the vendored copy is reverted or an upstream PR lands first
 
 #### Scenario: Upstream proto changes
 
-- **WHEN** the upstream `broadcast.proto` gains a new field via a merged
-  spec PR
+- **WHEN** the upstream `broadcast.proto` (or any other vendored
+  schema) gains a new field via a merged spec PR
 - **THEN** a contributor opens a follow-up PR against `ethp2p-rs` that
-  re-vendors the updated schema, and `cargo build` regenerates the Rust
+  re-vendors the updated schema, updates the SHA-256 in
+  `xtask/proto-hashes.toml`, and `cargo build` regenerates the Rust
   types via `prost-build`
 
 ### Requirement: Generated Rust types from upstream schemas
@@ -59,6 +59,8 @@ The generated module paths are:
 - `ethp2p_broadcast::pb::Sess` (oneof container with `Open`, `Update`
   variants)
 - `ethp2p_broadcast::pb::Chunk` namespace with `Chunk::Header`
+- `ethp2p_broadcast::pb::rs::Preamble` and
+  `ethp2p_broadcast::pb::rs::ChunkIdent`
 
 #### Scenario: Encoding a known input matches a golden corpus entry
 
@@ -169,11 +171,17 @@ This matches `specs/002-ec-broadcast.md` §6.
 ### Requirement: Conformance corpus and tests
 
 The codec SHALL ship a checked-in conformance corpus under
-`conformance/corpus/codec/` containing handcrafted golden tuples for the
-core message types. Tests SHALL load the corpus and assert byte-equality
-between produced encodings and the golden bytes. The corpus is a smoke
-test for slice 1 and is replaced/expanded by the Go-generated corpus
-when slice 2 lands the CGO oracle.
+`conformance/corpus/codec/` containing handcrafted golden tuples for
+the core message types. Tests SHALL load the corpus and assert byte-
+equality between produced encodings and the golden bytes. The corpus
+is a regression anchor; the Go-generated golden replacement happens
+incrementally as the goref shim is extended with the corresponding
+parse-and-reencode functions.
+
+The corpus SHALL include entries for each top-level wire message type
+across `protocol.proto`, `broadcast.proto`, and `rs.proto`. As of
+slice 3, this comprises at minimum: `bcast_handshake`, `sess_open`,
+`chunk_header`, `rs_preamble`, `rs_chunk_ident`.
 
 #### Scenario: CI runs the corpus tests
 
