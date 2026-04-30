@@ -16,6 +16,8 @@ ethp2p-protocol = { path = "../ethp2p-protocol" }
 prost = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
+reed-solomon-erasure = { workspace = true }
+sha2 = { workspace = true }
 
 [build-dependencies]
 prost-build = { workspace = true }

@@ -26,6 +26,7 @@ sha2 = "0.10"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+reed-solomon-erasure = "6"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

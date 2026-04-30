@@ -46,6 +46,20 @@ mod with_shim {
             out_len: *mut usize,
         ) -> c_int;
 
+        fn goref_rs_preamble_parse_and_reencode(
+            in_buf: *const u8,
+            in_len: usize,
+            out_buf: *mut *mut u8,
+            out_len: *mut usize,
+        ) -> c_int;
+
+        fn goref_rs_chunk_ident_parse_and_reencode(
+            in_buf: *const u8,
+            in_len: usize,
+            out_buf: *mut *mut u8,
+            out_len: *mut usize,
+        ) -> c_int;
+
         fn goref_free(buf: *mut u8);
     }
 
@@ -128,6 +142,18 @@ mod with_shim {
     #[must_use]
     pub fn chunk_header_parse_and_reencode(input: &[u8]) -> Option<Vec<u8>> {
         invoke(goref_chunk_header_parse_and_reencode, input)
+    }
+
+    /// Parse and re-encode a `broadcast.rs.Preamble` message.
+    #[must_use]
+    pub fn rs_preamble_parse_and_reencode(input: &[u8]) -> Option<Vec<u8>> {
+        invoke(goref_rs_preamble_parse_and_reencode, input)
+    }
+
+    /// Parse and re-encode a `broadcast.rs.ChunkIdent` message.
+    #[must_use]
+    pub fn rs_chunk_ident_parse_and_reencode(input: &[u8]) -> Option<Vec<u8>> {
+        invoke(goref_rs_chunk_ident_parse_and_reencode, input)
     }
 }
 

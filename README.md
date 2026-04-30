@@ -29,10 +29,10 @@ The port is delivered in seven numbered slices. Each slice is one or more
 
 | #  | Slice                          | Status        |
 |----|--------------------------------|---------------|
-| 0  | `bootstrap-rust-port`          | In progress   |
-| 1  | `port-broadcast-codec`         | Not started   |
-| 2  | `setup-cgo-fuzz-harness`       | Not started   |
-| 3  | `port-broadcast-rs-strategy`   | Not started   |
+| 0  | `bootstrap-rust-port`          | Done          |
+| 1  | `port-broadcast-codec`         | Done          |
+| 2  | `setup-cgo-fuzz-harness`       | Done (rails); shim follow-up pending |
+| 3  | `port-broadcast-rs-strategy`   | In progress   |
 | 4  | `port-broadcast-engine`        | Not started   |
 | 5  | `port-sim-harness`             | Not started   |
 | 6a | `extend-spec-transport`        | Deferred (upstream spec PRs) |

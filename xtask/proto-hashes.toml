@@ -16,3 +16,7 @@ sha256 = "1f703bf3173b4c1372585290c7ec4f92353c08c2265c8c82b7e5624f0a664982"
 [[proto]]
 path = "crates/ethp2p-broadcast/proto/broadcast.proto"
 sha256 = "2339e1fa03d6a5137a63e50fbe0c96132976448fad23dd857ae779f13da4f812"
+
+[[proto]]
+path = "crates/ethp2p-broadcast/proto/rs.proto"
+sha256 = "6579afba78abc0c6bb478e8fa3ed1de32e9b1359e0ba20ad289261a46ae8abb5"

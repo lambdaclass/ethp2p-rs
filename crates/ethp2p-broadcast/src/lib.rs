@@ -7,16 +7,25 @@
 
 pub mod chunk;
 pub mod selector;
+pub mod strategy;
 pub mod wire;
 
-/// Generated protobuf module from the vendored `proto/broadcast.proto`.
+/// Generated protobuf module from the vendored `proto/broadcast.proto`
+/// and `proto/rs.proto`.
 ///
-/// The vendored copy is byte-identical to the upstream schema at
-/// `github.com/ethp2p/ethp2p/broadcast/pb/broadcast.proto` and is
-/// verified by `cargo xtask check-protos`.
+/// The vendored copies are byte-identical to the upstream schemas at
+/// `github.com/ethp2p/ethp2p/broadcast/pb/broadcast.proto` and
+/// `github.com/ethp2p/ethp2p/broadcast/rs/pb/rs.proto`, verified by
+/// `cargo xtask check-protos`.
 #[allow(clippy::pedantic, clippy::all, missing_debug_implementations)]
 pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/ethp2p.broadcast.rs"));
+
+    /// Generated types for the Reed-Solomon broadcast strategy from
+    /// `proto/rs.proto` (proto package `ethp2p.broadcast.rs`).
+    pub mod rs {
+        include!(concat!(env!("OUT_DIR"), "/ethp2p.broadcast.rs.rs"));
+    }
 }
 
 /// Re-export of the foundational protocol types from `ethp2p-protocol`.

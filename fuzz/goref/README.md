@@ -92,6 +92,30 @@ void goref_free(uint8_t* buf);
 
 - Same contract for `broadcast.Chunk.Header`.
 
+### `goref_rs_preamble_parse_and_reencode` _(slice 3)_
+
+- Same contract for `broadcast.rs.Preamble` (the Reed-Solomon session
+  preamble). Implementation in the shim imports
+  `github.com/ethp2p/ethp2p/broadcast/rs/pb` and uses `proto.Marshal`
+  on the parsed message.
+
+### `goref_rs_chunk_ident_parse_and_reencode` _(slice 3)_
+
+- Same contract for `broadcast.rs.ChunkIdent`.
+
+### Future: `goref_rs_encode` and `goref_rs_decode` _(slice 3 follow-up)_
+
+These exports validate the Reed-Solomon **encoding** itself, not just
+the protobuf codec. Their FFI shape is intentionally not finalized in
+this README until the shim follow-up resolves whether the Rust
+`reed-solomon-erasure` crate produces byte-identical parity to
+`klauspost/reedsolomon`. If parity bytes diverge, a Rust-side
+configuration change or a switch to a different RS crate may be
+required, and the FFI surface will reflect the resolution.
+
+The slice-3 OpenSpec change documents this deferral. Add the
+specifications here when the follow-up PR proposes them.
+
 ### `goref_free`
 
 - See above.
