@@ -253,17 +253,16 @@ impl Strategy for RsStrategy {
         let peers: Vec<PeerId> = self.attached_peers.iter().copied().collect();
         for peer in peers {
             if let Some(idx) = self.planner.allocate(peer) {
-                let payload = if let Some(p) =
-                    self.chunks.get(idx as usize).and_then(Option::as_ref)
-                {
-                    p.clone()
-                } else {
-                    // Should not happen at origin (all shards present);
-                    // for relays, planner would not allocate a shard
-                    // we don't have. Defensive: cancel and skip.
-                    self.planner.cancel_in_flight(peer, idx);
-                    continue;
-                };
+                let payload =
+                    if let Some(p) = self.chunks.get(idx as usize).and_then(Option::as_ref) {
+                        p.clone()
+                    } else {
+                        // Should not happen at origin (all shards present);
+                        // for relays, planner would not allocate a shard
+                        // we don't have. Defensive: cancel and skip.
+                        self.planner.cancel_in_flight(peer, idx);
+                        continue;
+                    };
                 let handle = self.issue_handle();
                 self.in_flight.insert(handle, (peer, idx));
                 dispatches.push(ChunkDispatch {
