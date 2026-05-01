@@ -5,7 +5,10 @@
 //! stream-opening selector exchange, and the CHUNK stream layout. The
 //! engine and strategies arrive in slices 3 and 4.
 
+pub mod channel;
 pub mod chunk;
+pub mod engine;
+pub mod runtime;
 pub mod selector;
 pub mod session;
 pub mod strategy;
