@@ -17,7 +17,7 @@ This document is the handoff from explore mode. It seeds the
 | Source of truth | `specs/00*.md` + `*.proto` in the Go repo |
 | Process | Clean-room. Implementers may not read `.go` files. |
 | Wire commitment | Bit-compat at the **protocol/broadcast layer** only (option c). Transport layer is Rust-native. |
-| Transport stack | Direct on QUIC (likely `quinn`). No `rust-libp2p`. |
+| Transport stack | Direct on QUIC via `quinn`/`quinn-proto` (decided 2026-06-17 — see Decision log). No `rust-libp2p`. |
 | Sim runtime | Rust-native; `madsim` vs `turmoil` decision deferred to slice 5. |
 | Fuzz harness | CGO live oracle via `goref/` shim, plus corpus-replay lane for fast CI. |
 | License | Dual MIT + Apache-2.0. |
@@ -235,3 +235,42 @@ These are not technical:
 - The Go upstream eventually replaces libp2p with native QUIC streams
   (per spec intent). Slice 7 (interop) is gated on this.
 - LambdaClass owns both repos; this works without external negotiation.
+
+---
+
+## Decision log
+
+### 2026-06-17 — QUIC dependency: `quinn` / `quinn-proto`
+
+Resolves the deferred "likely `quinn`" transport-stack note. Slice 7
+(`port-transport-quic`) will run ethp2p directly on QUIC via the
+`quinn` crate family, **consuming `quinn-proto` (the sans-I/O state
+machine) directly** so the slice-6 deterministic sim can drive the
+transport, with the `quinn` tokio wrapper for production I/O.
+
+Evaluated `quinn`, `s2n-quic`, `quiche`, and `msquic` against this
+project's constraints (pure-Rust under `unsafe_code = "forbid"`;
+tokio-native; raw QUIC streams with no libp2p; dual MIT/Apache;
+MSRV ≤ 1.95; and — decisive — drivable for deterministic simulation).
+
+| Crate | Fit | Why |
+|---|---|---|
+| **quinn / quinn-proto** | **chosen** | Pure Rust (rustls + `ring`), dual MIT/Apache, raw bi/uni streams with app reset codes + per-stream flow control, and `quinn-proto` is an explicitly deterministic, I/O-free, caller-clocked state machine — its own test suite drives two endpoints over a virtual clock, matching the slice-6 discrete-event harness. |
+| s2n-quic | rejected | Pulls C (s2n-tls / `aws-lc-rs`) in **every** TLS config — no `ring`-only path; Apache-2.0 only; deterministic sim only via the unstable `bach` IO-testing runtime, not a state machine our `Net` trait can drive. |
+| quiche | rejected | Mandatory BoringSSL (C/C++); no rustls option. |
+| msquic | rejected | C/C++ via FFI, owns its own sockets/threads/timers (not sim-drivable), beta-only bindings. |
+
+Versions current at decision time (pin when slice 7 adds the crate):
+`quinn 0.11.9` (2025-08-27), `quinn-proto 0.11.14` (2026-03-09);
+both actively maintained, MSRV 1.80 / 1.74.
+
+Caveats to carry into slice 7:
+- Stay on the `ring` rustls backend; the `aws-lc-rs` backend vendors
+  BoringSSL (C).
+- Seed `quinn-proto`'s RNG deterministically — connection IDs come from
+  a caller-supplied RNG; required for a reproducible sim.
+- "Deterministic" holds at the protocol/event level, not raw-ciphertext
+  bytes (the rustls handshake runs inside the state machine).
+- No crate is added to `Cargo.toml` yet: slice 7 is still gated on the
+  upstream transport-spec extensions, so adding `quinn` now would be a
+  dead dependency. This is a decision record, not an integration.
