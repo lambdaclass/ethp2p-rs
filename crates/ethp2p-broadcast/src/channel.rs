@@ -11,7 +11,7 @@
     clippy::struct_field_names
 )]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::session::{Session, SessionError};
 use crate::strategy::{PeerId, Strategy, TakeOutcome};
@@ -65,8 +65,10 @@ impl From<SessionError> for ChannelError {
 /// Per-channel container.
 pub struct Channel<S: Strategy> {
     channel_id: ChannelId,
-    subscribers: HashSet<PeerId>,
-    sessions: HashMap<MessageId, Session<S>>,
+    // BTree collections: iteration order feeds dispatch order, which
+    // must be deterministic for the sim harness's seed-reproducibility.
+    subscribers: BTreeSet<PeerId>,
+    sessions: BTreeMap<MessageId, Session<S>>,
     factory: StrategyFactory<S>,
 }
 
@@ -85,8 +87,8 @@ impl<S: Strategy> Channel<S> {
     pub fn new(channel_id: ChannelId, factory: StrategyFactory<S>) -> Self {
         Self {
             channel_id,
-            subscribers: HashSet::new(),
-            sessions: HashMap::new(),
+            subscribers: BTreeSet::new(),
+            sessions: BTreeMap::new(),
             factory,
         }
     }
@@ -181,7 +183,7 @@ impl<S: Strategy> Channel<S> {
 
     /// Current subscriber set.
     #[must_use]
-    pub fn subscribers(&self) -> &HashSet<PeerId> {
+    pub fn subscribers(&self) -> &BTreeSet<PeerId> {
         &self.subscribers
     }
 }

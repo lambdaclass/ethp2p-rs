@@ -30,6 +30,8 @@ reed-solomon-erasure = "6"
 futures = "0.3"
 tracing = "0.1"
 tokio-stream = "0.1"
+rand = "0.9"
+rand_chacha = "0.9"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -10,7 +10,7 @@
     clippy::cast_possible_wrap
 )]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::pb::rs::Preamble;
 use crate::strategy::bitmap::BitMap;
@@ -31,10 +31,13 @@ pub struct RsStrategy {
     /// received.
     chunks: Vec<Option<Vec<u8>>>,
     planner: EmitPlanner,
-    attached_peers: HashSet<PeerId>,
+    // BTree collections: `poll_chunks` iterates peers and
+    // `routing_update` iterates in-flight handles; both orders are
+    // wire-visible and must be deterministic for sim reproducibility.
+    attached_peers: BTreeSet<PeerId>,
     /// Maps each emitted [`DispatchHandle`] to its `(peer, idx)` so
     /// `chunk_sent` can correlate the callback back to the planner.
-    in_flight: HashMap<DispatchHandle, (PeerId, u32)>,
+    in_flight: BTreeMap<DispatchHandle, (PeerId, u32)>,
     next_handle: DispatchHandle,
     /// Last set-bit count we emitted via `poll_routing`. Used to gate
     /// the bitmap-threshold logic from spec §5.
@@ -43,24 +46,48 @@ pub struct RsStrategy {
 
 impl RsStrategy {
     /// Construct an origin strategy: encode the payload up-front and
-    /// configure the planner for unbounded allocations.
+    /// configure the planner for unbounded allocations. The planner
+    /// tie-break seed is randomly chosen, per spec.
     pub fn new_origin(payload: &[u8], config: RsConfig) -> Result<Self, EncodeError> {
+        Self::new_origin_with_seed(payload, config, planner_seed())
+    }
+
+    /// [`Self::new_origin`] with an explicit planner tie-break seed.
+    /// Deterministic callers (the sim harness) inject the seed so that
+    /// shard emission order is reproducible.
+    pub fn new_origin_with_seed(
+        payload: &[u8],
+        config: RsConfig,
+        seed: u64,
+    ) -> Result<Self, EncodeError> {
         let (preamble, shards) = encode(payload, &config)?;
         let total = shards.len() as u32;
         let chunks: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
-        let planner = EmitPlanner::new(total, planner_seed(), PlannerMode::Origin);
+        let planner = EmitPlanner::new(total, seed, PlannerMode::Origin);
         Ok(Self::with(config, preamble, chunks, planner))
     }
 
     /// Construct a relay strategy: validate the preamble and configure
-    /// the planner with the per-shard forward-multiplier cap.
+    /// the planner with the per-shard forward-multiplier cap. The
+    /// planner tie-break seed is randomly chosen, per spec.
     pub fn new_relay(preamble: Preamble, config: RsConfig) -> Result<Self, PreambleError> {
+        Self::new_relay_with_seed(preamble, config, planner_seed())
+    }
+
+    /// [`Self::new_relay`] with an explicit planner tie-break seed.
+    /// Deterministic callers (the sim harness) inject the seed so that
+    /// shard emission order is reproducible.
+    pub fn new_relay_with_seed(
+        preamble: Preamble,
+        config: RsConfig,
+        seed: u64,
+    ) -> Result<Self, PreambleError> {
         validate_preamble(&preamble)?;
         let total = (preamble.num_data + preamble.num_parity) as u32;
         let chunks = vec![None; total as usize];
         let planner = EmitPlanner::new(
             total,
-            planner_seed(),
+            seed,
             PlannerMode::Relay {
                 forward_multiplier: config.forward_multiplier,
             },
@@ -79,8 +106,8 @@ impl RsStrategy {
             preamble,
             chunks,
             planner,
-            attached_peers: HashSet::new(),
-            in_flight: HashMap::new(),
+            attached_peers: BTreeSet::new(),
+            in_flight: BTreeMap::new(),
             next_handle: 0,
             last_routing_emitted_count: 0,
         }

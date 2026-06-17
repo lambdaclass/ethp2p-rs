@@ -15,7 +15,7 @@
     clippy::needless_pass_by_value
 )]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
 
 use futures::stream::{Stream, StreamExt};
@@ -87,8 +87,10 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub struct Engine<S: Strategy<RoutingUpdate = crate::strategy::bitmap::BitMap>, N: Net> {
     local_peer: PeerId,
     local_peer_str: String,
-    channels: HashMap<ChannelId, Channel<S>>,
-    connected: HashSet<PeerId>,
+    // BTree collections: iteration order feeds send order, which must
+    // be deterministic for the sim harness's seed-reproducibility.
+    channels: BTreeMap<ChannelId, Channel<S>>,
+    connected: BTreeSet<PeerId>,
     delivered: mpsc::Sender<DeliveredMessage>,
     net: N,
     events: Pin<Box<dyn Stream<Item = NetEvent> + Send + 'static>>,
@@ -120,8 +122,8 @@ where
         Self {
             local_peer,
             local_peer_str: format!("peer-{local_peer}"),
-            channels: HashMap::new(),
-            connected: HashSet::new(),
+            channels: BTreeMap::new(),
+            connected: BTreeSet::new(),
             delivered,
             net,
             events,
@@ -406,5 +408,27 @@ pub fn rs_relay_factory(
             .map_err(|e| ChannelError::InvalidPreamble(format!("{e}")))?;
         crate::strategy::rs::state::RsStrategy::new_relay(preamble, config)
             .map_err(|e| ChannelError::InvalidPreamble(format!("{e:?}")))
+    })
+}
+
+/// [`rs_relay_factory`] with deterministic planner seeding: the n-th
+/// strategy the factory constructs gets seed `base_seed + n`. Used by
+/// the sim harness, where reproducibility requires every relay
+/// strategy's shard emission order to derive from the scenario seed.
+pub fn rs_relay_factory_seeded(
+    config: crate::strategy::config::RsConfig,
+    base_seed: u64,
+) -> StrategyFactory<crate::strategy::rs::state::RsStrategy> {
+    let counter = std::sync::atomic::AtomicU64::new(0);
+    Box::new(move |preamble_bytes: Vec<u8>| {
+        let preamble = Preamble::decode(preamble_bytes.as_slice())
+            .map_err(|e| ChannelError::InvalidPreamble(format!("{e}")))?;
+        let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::strategy::rs::state::RsStrategy::new_relay_with_seed(
+            preamble,
+            config,
+            base_seed.wrapping_add(n),
+        )
+        .map_err(|e| ChannelError::InvalidPreamble(format!("{e:?}")))
     })
 }
