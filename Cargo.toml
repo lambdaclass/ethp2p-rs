@@ -32,6 +32,12 @@ tracing = "0.1"
 tokio-stream = "0.1"
 rand = "0.9"
 rand_chacha = "0.9"
+# QUIC transport (decision: quinn / quinn-proto on the ring backend — see
+# port-decisions.md Decision log). Pinned at the versions current at the
+# decision; ring backend avoids the aws-lc-rs BoringSSL C dependency.
+quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
