@@ -1,6 +1,6 @@
 [package]
 name = "ethp2p-transport"
-description = "Direct-on-QUIC transport for ethp2p (stub awaiting slice 6b)."
+description = "Direct-on-QUIC transport for ethp2p (demo / proof-of-concept; spec-conformant slice 7 is gated)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,3 +12,15 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+ethp2p-broadcast = { path = "../ethp2p-broadcast" }
+quinn.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
+prost.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "io-util", "macros"] }
+tokio-stream.workspace = true
+futures.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
