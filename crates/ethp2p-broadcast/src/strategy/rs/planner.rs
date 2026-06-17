@@ -4,7 +4,7 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use crate::strategy::bitmap::BitMap;
 
@@ -54,7 +54,7 @@ impl PartialOrd for EmitEntry {
 
 #[derive(Debug, Default)]
 struct PeerState {
-    in_flight: HashSet<u32>,
+    in_flight: BTreeSet<u32>,
     optimistic_havelist: Option<BitMap>,
 }
 
@@ -66,9 +66,9 @@ pub struct EmitPlanner {
     /// `BinaryHeap` provides max-heap; we wrap entries in `Reverse` to
     /// get min-heap behavior.
     heap: BinaryHeap<Reverse<EmitEntry>>,
-    allocation: HashMap<u32, u32>,
-    sent_count: HashMap<u32, u32>,
-    peers: HashMap<PeerId, PeerState>,
+    allocation: BTreeMap<u32, u32>,
+    sent_count: BTreeMap<u32, u32>,
+    peers: BTreeMap<PeerId, PeerState>,
 }
 
 impl EmitPlanner {
@@ -88,9 +88,9 @@ impl EmitPlanner {
             mode,
             num_shards,
             heap,
-            allocation: HashMap::new(),
-            sent_count: HashMap::new(),
-            peers: HashMap::new(),
+            allocation: BTreeMap::new(),
+            sent_count: BTreeMap::new(),
+            peers: BTreeMap::new(),
         }
     }
 
