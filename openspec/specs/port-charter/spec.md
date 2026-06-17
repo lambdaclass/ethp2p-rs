@@ -9,7 +9,6 @@ the dual MIT + Apache 2.0 license posture, and the seven-slice delivery
 roadmap. Subsequent capability specs reference these requirements when
 claiming wire conformance, license compliance, or process discipline.
 This spec defines no runtime behavior of its own.
-
 ## Requirements
 ### Requirement: Spec source of truth
 
@@ -140,8 +139,14 @@ landing as one or more OpenSpec change proposals:
    bitmap operations, consistent-hash relay deduplication.
 5. `port-broadcast-engine` — engine, session, channel; abstracted over
    clock, spawn, and network for sim compatibility.
-6. `port-sim-harness` — Rust-native simulation harness; `madsim` vs
-   `turmoil` selected at this slice.
+6. `port-sim-harness` — Rust-native deterministic simulation harness
+   built on a bespoke discrete-event core over tokio's current-thread
+   runtime, with a bespoke virtual clock (an event heap, not tokio's
+   `start_paused`). This runtime was selected at this slice over
+   `madsim` and `turmoil`: the engine's caller-driven event loop lets
+   the harness own interleaving, making `turmoil`'s simulated socket
+   network redundant with the `Net` trait seam and `madsim`'s
+   `--cfg madsim` dependency patching unnecessary intrusion.
 7. `port-transport-quic` — direct-on-QUIC transport, gated on prior
    spec-extension PRs against the upstream Go repository.
 

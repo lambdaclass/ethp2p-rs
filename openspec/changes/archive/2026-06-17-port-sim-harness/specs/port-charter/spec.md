@@ -19,10 +19,11 @@ landing as one or more OpenSpec change proposals:
    clock, spawn, and network for sim compatibility.
 6. `port-sim-harness` — Rust-native deterministic simulation harness
    built on a bespoke discrete-event core over tokio's current-thread
-   runtime with paused virtual time. This runtime was selected at this
-   slice over `madsim` and `turmoil`: the engine's caller-driven event
-   loop lets the harness own interleaving, making `turmoil`'s simulated
-   socket network redundant with the `Net` trait seam and `madsim`'s
+   runtime, with a bespoke virtual clock (an event heap, not tokio's
+   `start_paused`). This runtime was selected at this slice over
+   `madsim` and `turmoil`: the engine's caller-driven event loop lets
+   the harness own interleaving, making `turmoil`'s simulated socket
+   network redundant with the `Net` trait seam and `madsim`'s
    `--cfg madsim` dependency patching unnecessary intrusion.
 7. `port-transport-quic` — direct-on-QUIC transport, gated on prior
    spec-extension PRs against the upstream Go repository.
