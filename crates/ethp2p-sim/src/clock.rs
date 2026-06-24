@@ -50,20 +50,20 @@ mod tests {
         let clock = hub.clock();
         let before = clock.now();
 
-        let mut sleep = clock.sleep(Duration::from_hours(1));
+        let mut sleep = clock.sleep(Duration::from_secs(3600));
         assert!(
             (&mut sleep).now_or_never().is_none(),
             "sleep must not resolve before virtual time advances"
         );
 
         let wall_start = Instant::now();
-        hub.advance_to(Duration::from_hours(1));
+        hub.advance_to(Duration::from_secs(3600));
         assert!((&mut sleep).now_or_never().is_some());
         assert!(
-            wall_start.elapsed() < Duration::from_mins(1),
+            wall_start.elapsed() < Duration::from_secs(60),
             "virtual advance must not consume wall-clock time"
         );
-        assert!(clock.now() >= before + Duration::from_hours(1));
+        assert!(clock.now() >= before + Duration::from_secs(3600));
     }
 
     #[test]

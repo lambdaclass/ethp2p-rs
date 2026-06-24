@@ -2,7 +2,7 @@
 name = "ethp2p-fuzz"
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.95"
+rust-version = "1.92"
 publish = false
 authors = ["LambdaClass <contact@lambdaclass.com>"]
 license = "MIT OR Apache-2.0"
