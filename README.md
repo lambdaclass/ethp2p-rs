@@ -5,8 +5,12 @@ next-generation P2P networking stack purpose-built for Ethereum. The port
 is **spec-driven**: the upstream `specs/00*.md` and `*.proto` files are the
 contract; the upstream Go source is not consulted.
 
-> **Status:** early WIP. The repository is being assembled slice by slice.
-> Nothing here is production-ready. There is no public API yet.
+> **Status:** WIP. Slices 1-6 — codec, fuzz-harness rails, Reed-Solomon
+> broadcast strategy, engine, and deterministic sim harness — are landed
+> and spec-conformant. Slice 7 (direct-on-QUIC transport) exists only as
+> a non-spec-conformant proof-of-concept, gated on upstream spec
+> extensions. Nothing here is production-ready; there is no stable
+> public API yet.
 
 ## Why this exists
 
@@ -27,17 +31,15 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the policy.
 The port is delivered in seven numbered slices. Each slice is one or more
 [OpenSpec](https://github.com/Fission-AI/OpenSpec) change proposals.
 
-| #  | Slice                          | Status        |
-|----|--------------------------------|---------------|
-| 0  | `bootstrap-rust-port`          | Done          |
-| 1  | `port-broadcast-codec`         | Done          |
-| 2  | `setup-cgo-fuzz-harness`       | Done (rails); shim follow-up pending |
-| 3  | `port-broadcast-rs-strategy`   | In progress   |
-| 4  | `port-broadcast-engine`        | Not started   |
-| 5  | `port-sim-harness`             | Not started   |
-| 6a | `extend-spec-transport`        | Deferred (upstream spec PRs) |
-| 6b | `port-transport-quic`          | Deferred (gated on 6a) |
-| 7  | `interop-with-go-node`         | Deferred (gated on Go side dropping libp2p) |
+| # | Slice                        | Status        |
+|---|-------------------------------|---------------|
+| 1 | `bootstrap-rust-port`         | Done          |
+| 2 | `port-broadcast-codec`        | Done          |
+| 3 | `setup-cgo-fuzz-harness`      | Done (rails); `goref/` shim follow-up pending |
+| 4 | `port-broadcast-rs-strategy`  | Done          |
+| 5 | `port-broadcast-engine`       | Done          |
+| 6 | `port-sim-harness`            | Done          |
+| 7 | `port-transport-quic`         | Gated on upstream spec PRs; a non-spec-conformant demo lives in `ethp2p-transport` |
 
 The wire-compatibility promise applies at the **protocol layer**: protobuf
 messages and broadcast-strategy outputs are byte-identical to the Go
@@ -50,12 +52,12 @@ speaks direct-on-QUIC per spec intent, while upstream Go currently uses
 
 ```
 crates/
-  ethp2p-protocol/    Foundational protocol types and codecs (slice 1)
-  ethp2p-broadcast/   Erasure-coded broadcast engine + strategies (slices 1, 3, 4)
-  ethp2p-transport/   Direct-on-QUIC transport (slice 6b)
-  ethp2p-sim/         Rust-native simulation harness (slice 5)
+  ethp2p-protocol/    Foundational protocol types and codecs (slice 2)
+  ethp2p-broadcast/   Erasure-coded broadcast engine + strategies (slices 2, 4, 5)
+  ethp2p-transport/   Direct-on-QUIC transport demo (slice 7, gated / non-spec-conformant)
+  ethp2p-sim/         Rust-native deterministic simulation harness (slice 6)
 xtask/                Repository automation
-fuzz/                 (slice 2) cargo-fuzz targets + goref/ shim
+fuzz/                 (slice 3) cargo-fuzz targets + goref/ shim (shim pending)
 openspec/             Change proposals and capability specs
 ```
 
@@ -79,7 +81,7 @@ In short: do not read `.go` files in `github.com/ethp2p/ethp2p`. The
 spec is at `specs/*.md` and `*.proto` in that repo. If the spec is
 ambiguous, open a PR upstream to disambiguate before implementing.
 
-The single exception is the `goref/` shim maintainer (slice 2 onward),
+The single exception is the `goref/` shim maintainer (slice 3 onward),
 who imports the Go module as an opaque dependency to expose a C ABI for
 the differential fuzz harness.
 

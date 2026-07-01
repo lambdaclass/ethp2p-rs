@@ -13,15 +13,13 @@ acknowledgments will not be reviewed. See CONTRIBUTING.md for details.
 
 <!-- Which slice does this PR belong to? -->
 
-- [ ] 0. bootstrap-rust-port
-- [ ] 1. port-broadcast-codec
-- [ ] 2. setup-cgo-fuzz-harness
-- [ ] 3. port-broadcast-rs-strategy
-- [ ] 4. port-broadcast-engine
-- [ ] 5. port-sim-harness
-- [ ] 6a. extend-spec-transport (PRs against upstream Go repo)
-- [ ] 6b. port-transport-quic
-- [ ] 7. interop-with-go-node
+- [ ] 1. bootstrap-rust-port
+- [ ] 2. port-broadcast-codec
+- [ ] 3. setup-cgo-fuzz-harness
+- [ ] 4. port-broadcast-rs-strategy
+- [ ] 5. port-broadcast-engine
+- [ ] 6. port-sim-harness
+- [ ] 7. port-transport-quic (gated on upstream spec PRs)
 - [ ] Out-of-band — justification:
 
 ## Linked OpenSpec change
