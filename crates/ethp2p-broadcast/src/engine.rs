@@ -99,6 +99,14 @@ pub struct Engine<S: Strategy<RoutingUpdate = crate::strategy::bitmap::BitMap>, 
     /// dispatch handle passed in [`NetSend::Chunk`]; value is the target
     /// peer. Resolved (and removed) by [`NetEvent::ChunkSendResult`].
     pending_sends: BTreeMap<(ChannelId, MessageId, u64), PeerId>,
+    /// Preamble bytes retained per active session so a `SessionOpen` can be
+    /// (re-)sent to any subscriber, not only at origin-publish time. Required
+    /// for relays, which must open a SESS to their own subscribers before
+    /// forwarding routing/chunks. Cleared when the session is disposed.
+    session_preambles: BTreeMap<(ChannelId, MessageId), Vec<u8>>,
+    /// Peers we have already sent a `SessionOpen` for a given session, so it
+    /// is emitted at most once per (session, peer).
+    opened_to: BTreeMap<(ChannelId, MessageId), BTreeSet<PeerId>>,
 }
 
 impl<S, N> std::fmt::Debug for Engine<S, N>
@@ -133,6 +141,8 @@ where
             net,
             events,
             pending_sends: BTreeMap::new(),
+            session_preambles: BTreeMap::new(),
+            opened_to: BTreeMap::new(),
         }
     }
 
@@ -200,16 +210,14 @@ where
             .get_mut(channel_id)
             .ok_or_else(|| EngineError::UnknownChannel(channel_id.clone()))?;
         channel.start_origin_session(message_id.clone(), strategy)?;
-        // Open SESS streams to all subscribed peers.
         let subscribers: Vec<PeerId> = channel.subscribers().iter().copied().collect();
+        // Retain the preamble so relays (and late subscribers) can be sent a
+        // SessionOpen on demand from `drain_session`.
+        self.session_preambles
+            .insert((channel_id.clone(), message_id.clone()), preamble_bytes);
+        // Open SESS streams to all currently-subscribed peers.
         for peer in &subscribers {
-            self.net.send(NetSend::SessionOpen {
-                peer: *peer,
-                channel: channel_id.clone(),
-                message_id: message_id.clone(),
-                preamble: preamble_bytes.clone(),
-                initial_update: Vec::new(),
-            })?;
+            self.ensure_session_open(channel_id, &message_id, *peer)?;
         }
         // Drain outbound work for the new session.
         self.drain_session(channel_id, &message_id)?;
@@ -268,12 +276,22 @@ where
                 preamble,
                 ..
             } => {
-                if let Some(c) = self.channels.get_mut(&channel) {
-                    if let Err(e) = c.open_session(message_id.clone(), preamble) {
-                        tracing::debug!(?e, "open_session failed");
-                    } else {
-                        let _ = self.drain_session(&channel, &message_id);
-                    }
+                let opened = match self.channels.get_mut(&channel) {
+                    Some(c) => match c.open_session(message_id.clone(), preamble.clone()) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::debug!(?e, "open_session failed");
+                            false
+                        }
+                    },
+                    None => false,
+                };
+                if opened {
+                    // Retain the preamble so this node, acting as a relay, can
+                    // open a SESS to its own subscribers before forwarding.
+                    self.session_preambles
+                        .insert((channel.clone(), message_id.clone()), preamble);
+                    let _ = self.drain_session(&channel, &message_id);
                 }
             }
             NetEvent::Chunk {
@@ -308,6 +326,11 @@ where
             NetEvent::PeerDisconnected { peer } => {
                 self.connected.remove(&peer);
                 self.pending_sends.retain(|_k, p| *p != peer);
+                // Forget that we opened sessions to this peer, so a SESS is
+                // re-opened if it reconnects.
+                for set in self.opened_to.values_mut() {
+                    set.remove(&peer);
+                }
                 for c in self.channels.values_mut() {
                     c.unsubscribe_peer(peer);
                 }
@@ -353,6 +376,33 @@ where
             }
             let _ = self.drain_session(channel, message_id);
         }
+    }
+
+    /// Send `peer` a `SessionOpen` for this session if we have not already,
+    /// using the retained preamble. Idempotent per (session, peer); a no-op
+    /// when the peer was already opened or no preamble is retained.
+    fn ensure_session_open(
+        &mut self,
+        channel_id: &ChannelId,
+        message_id: &MessageId,
+        peer: PeerId,
+    ) -> Result<(), EngineError> {
+        let key = (channel_id.clone(), message_id.clone());
+        if self.opened_to.get(&key).is_some_and(|s| s.contains(&peer)) {
+            return Ok(());
+        }
+        let Some(preamble) = self.session_preambles.get(&key).cloned() else {
+            return Ok(());
+        };
+        self.net.send(NetSend::SessionOpen {
+            peer,
+            channel: channel_id.clone(),
+            message_id: message_id.clone(),
+            preamble,
+            initial_update: Vec::new(),
+        })?;
+        self.opened_to.entry(key).or_default().insert(peer);
+        Ok(())
     }
 
     fn drain_channel(&mut self, channel_id: &ChannelId) -> Result<(), EngineError> {
@@ -402,6 +452,10 @@ where
             if let Some(routing) = work.routing {
                 let payload = routing.as_bytes();
                 for peer in &subs {
+                    // A routing update rides the SESS stream, which must be
+                    // opened first (crucial for relays, which have not yet
+                    // sent their subscribers a SessionOpen).
+                    self.ensure_session_open(channel_id, message_id, *peer)?;
                     self.net.send(NetSend::RoutingUpdate {
                         peer: *peer,
                         channel: channel_id.clone(),
@@ -414,6 +468,10 @@ where
             for d in work.dispatches {
                 let chunk_id: u32 = d.chunk_id;
                 let token = d.handle;
+                // Ensure the receiver has an open session before its chunks
+                // arrive (relays forward to subscribers they have not opened
+                // a SESS with yet).
+                self.ensure_session_open(channel_id, message_id, d.peer)?;
                 let result = self.net.send(NetSend::Chunk {
                     peer: d.peer,
                     channel: channel_id.clone(),
