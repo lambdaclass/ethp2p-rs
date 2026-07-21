@@ -234,6 +234,8 @@ where
         Ok(StepResult::Processed)
     }
 
+    // A flat dispatch over every inbound event kind.
+    #[allow(clippy::too_many_lines)]
     fn handle_event(&mut self, event: NetEvent) {
         match event {
             NetEvent::Handshake {
@@ -347,6 +349,16 @@ where
                 token,
                 ok,
             } => self.resolve_chunk_send(peer, &channel, &message_id, token, ok),
+            NetEvent::PeerReconstructed {
+                peer,
+                channel,
+                message_id,
+            } => self.detach_session_peer(&channel, &message_id, peer, true),
+            NetEvent::SessionClosed {
+                peer,
+                channel,
+                message_id,
+            } => self.detach_session_peer(&channel, &message_id, peer, false),
         }
     }
 
@@ -506,24 +518,50 @@ where
     }
 
     fn maybe_decode_and_deliver(&mut self, channel_id: &ChannelId, message_id: &MessageId) {
-        let Some(session) = self
+        let decoded = match self
             .channels
             .get_mut(channel_id)
             .and_then(|c| c.session_mut(message_id))
-        else {
-            return;
+        {
+            Some(session) => session.decode_and_finish(),
+            None => return,
         };
-        match session.decode_and_finish() {
+        match decoded {
             Ok(payload) => {
                 let _ = self.delivered.try_send(DeliveredMessage {
                     channel_id: channel_id.clone(),
                     message_id: message_id.clone(),
                     payload,
                 });
+                // Signal upstream senders we are done: reset our inbound SESS
+                // streams for this session. Each sender observes the reset as
+                // `PeerReconstructed` and stops planning sends to us.
+                let _ = self.net.send(NetSend::SessionReconstructed {
+                    channel: channel_id.clone(),
+                    message_id: message_id.clone(),
+                });
             }
             Err(e) => {
                 tracing::warn!(?e, "decode_and_finish failed");
             }
+        }
+    }
+
+    /// Detach `peer` from one session, forwarding the reconstructed/departed
+    /// distinction to the strategy. A no-op if the session is gone.
+    fn detach_session_peer(
+        &mut self,
+        channel: &ChannelId,
+        message_id: &MessageId,
+        peer: PeerId,
+        completed: bool,
+    ) {
+        if let Some(session) = self
+            .channels
+            .get_mut(channel)
+            .and_then(|c| c.session_mut(message_id))
+        {
+            session.detach_peer(peer, completed);
         }
     }
 }

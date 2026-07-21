@@ -15,7 +15,7 @@
 //! Slice 4b: deterministic FIFO per (sender, receiver). No drops,
 //! delays, or reorders. Fault injection is slice 5.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
@@ -27,11 +27,17 @@ use crate::runtime::{Net, NetError, NetEvent, NetSend};
 use crate::strategy::PeerId;
 
 type SenderMap = Arc<Mutex<HashMap<PeerId, mpsc::UnboundedSender<NetEvent>>>>;
+/// Per `(receiver, channel, message_id)`, the peers that opened an inbound
+/// session to the receiver — the in-process analogue of inbound SESS streams.
+/// A `SessionReconstructed` from the receiver resets these, delivering a
+/// `PeerReconstructed` to each opener.
+type OpenerMap = Arc<Mutex<HashMap<(PeerId, String, String), BTreeSet<PeerId>>>>;
 
 /// Switchboard shared across in-process engines.
 #[derive(Debug, Clone, Default)]
 pub struct MemoryNetHub {
     senders: SenderMap,
+    inbound_openers: OpenerMap,
 }
 
 impl MemoryNetHub {
@@ -51,6 +57,7 @@ impl MemoryNetHub {
         MemoryNetEndpoint {
             peer_id,
             senders: Arc::clone(&self.senders),
+            inbound_openers: Arc::clone(&self.inbound_openers),
             inbound: Arc::new(Mutex::new(Some(rx))),
         }
     }
@@ -68,6 +75,7 @@ impl MemoryNetHub {
 pub struct MemoryNetEndpoint {
     peer_id: PeerId,
     senders: SenderMap,
+    inbound_openers: OpenerMap,
     /// `Option` so [`Net::events`] can take it once. Future calls
     /// return an empty stream.
     inbound: Arc<Mutex<Option<mpsc::UnboundedReceiver<NetEvent>>>>,
@@ -82,7 +90,36 @@ impl MemoryNetEndpoint {
 }
 
 impl Net for MemoryNetEndpoint {
+    // A flat conversion over every outbound message kind.
+    #[allow(clippy::too_many_lines)]
     fn send(&self, msg: NetSend) -> Result<(), NetError> {
+        // No-destination local command: we reconstructed a session, so notify
+        // every peer that opened an inbound session to us (the analogue of
+        // resetting our inbound SESS streams with code 0x01).
+        if let NetSend::SessionReconstructed {
+            channel,
+            message_id,
+        } = &msg
+        {
+            let openers = self
+                .inbound_openers
+                .lock()
+                .expect("openers mutex")
+                .remove(&(self.peer_id, channel.clone(), message_id.clone()))
+                .unwrap_or_default();
+            let map = self.senders.lock().expect("hub mutex");
+            for opener in openers {
+                if let Some(tx) = map.get(&opener) {
+                    let _ = tx.send(NetEvent::PeerReconstructed {
+                        peer: self.peer_id,
+                        channel: channel.clone(),
+                        message_id: message_id.clone(),
+                    });
+                }
+            }
+            return Ok(());
+        }
+
         let dst = match &msg {
             NetSend::Handshake { peer, .. }
             | NetSend::Subscribe { peer, .. }
@@ -90,7 +127,25 @@ impl Net for MemoryNetEndpoint {
             | NetSend::SessionOpen { peer, .. }
             | NetSend::RoutingUpdate { peer, .. }
             | NetSend::Chunk { peer, .. } => *peer,
+            NetSend::SessionReconstructed { .. } => unreachable!("handled above"),
         };
+
+        // Record that we opened an inbound session to `dst`, so its later
+        // SessionReconstructed can reach us as PeerReconstructed.
+        if let NetSend::SessionOpen {
+            peer,
+            channel,
+            message_id,
+            ..
+        } = &msg
+        {
+            self.inbound_openers
+                .lock()
+                .expect("openers mutex")
+                .entry((*peer, channel.clone(), message_id.clone()))
+                .or_default()
+                .insert(self.peer_id);
+        }
 
         // Capture chunk correlation before `msg` is consumed, so we can echo
         // a `ChunkSendResult` back to ourselves. The real transport reports a
@@ -164,6 +219,7 @@ impl Net for MemoryNetEndpoint {
                 chunk_id,
                 payload,
             },
+            NetSend::SessionReconstructed { .. } => unreachable!("handled above"),
         };
 
         let map = self.senders.lock().expect("hub mutex");
@@ -276,5 +332,43 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(err, NetError::PeerNotFound(99));
+    }
+
+    #[tokio::test]
+    async fn session_reconstructed_notifies_openers() {
+        let hub = MemoryNetHub::new();
+        let a = hub.endpoint(1);
+        let b = hub.endpoint(2);
+        let mut a_events = a.events();
+
+        // A opens a session to B, registering A as an inbound opener at B.
+        a.send(NetSend::SessionOpen {
+            peer: 2,
+            channel: "ch".into(),
+            message_id: "m".into(),
+            preamble: vec![],
+            initial_update: vec![],
+        })
+        .unwrap();
+
+        // B reconstructs and resets its inbound sessions; A must observe it.
+        b.send(NetSend::SessionReconstructed {
+            channel: "ch".into(),
+            message_id: "m".into(),
+        })
+        .unwrap();
+
+        match a_events.next().await {
+            Some(NetEvent::PeerReconstructed {
+                peer,
+                channel,
+                message_id,
+            }) => {
+                assert_eq!(peer, 2);
+                assert_eq!(channel, "ch");
+                assert_eq!(message_id, "m");
+            }
+            other => panic!("expected PeerReconstructed, got {other:?}"),
+        }
     }
 }

@@ -95,6 +95,12 @@ pub enum NetSend {
         /// to the right in-flight allocation.
         token: u64,
     },
+    /// Local command (no peer): this node reconstructed
+    /// `(channel, message_id)`. The transport MUST reset all *inbound* SESS
+    /// streams for that session with the reconstructed application error
+    /// code (`0x01`), telling every upstream sender we are done. Peers
+    /// observe the reset as [`NetEvent::PeerReconstructed`].
+    SessionReconstructed { channel: String, message_id: String },
 }
 
 /// Inbound event from [`Net::events`]. The `peer` field denotes the
@@ -158,6 +164,23 @@ pub enum NetEvent {
         message_id: String,
         token: u64,
         ok: bool,
+    },
+    /// A peer reset its outbound SESS stream to us with the reconstructed
+    /// code (`0x01`): it has reconstructed `(channel, message_id)`. The
+    /// engine detaches it from the session as completed, freeing the budget
+    /// of any further sends planned to it.
+    PeerReconstructed {
+        peer: PeerId,
+        channel: String,
+        message_id: String,
+    },
+    /// A peer closed its SESS stream to us (plain FIN, or a reset with a
+    /// code other than the reconstructed one): it departed the session
+    /// without completing. The engine detaches it as not completed.
+    SessionClosed {
+        peer: PeerId,
+        channel: String,
+        message_id: String,
     },
 }
 

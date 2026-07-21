@@ -224,6 +224,12 @@ async fn outbound_pump(
 ) {
     let mut streams: HashMap<PeerId, SendStream> = HashMap::new();
     while let Some(msg) = outbound_rx.recv().await {
+        // This demo transport does not model reconstruct-detach; the
+        // no-destination reset command is dropped (superseded by the spec
+        // transport, which resets inbound SESS streams with code 0x01).
+        if matches!(msg, NetSend::SessionReconstructed { .. }) {
+            continue;
+        }
         let dst = dest_peer(&msg);
         if !streams.contains_key(&dst) {
             let Some(conn) = wait_for_conn(&conns, dst).await else {
