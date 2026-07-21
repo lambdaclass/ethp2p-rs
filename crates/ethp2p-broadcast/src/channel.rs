@@ -177,6 +177,12 @@ impl<S: Strategy> Channel<S> {
     }
 
     /// Look up a session mutably by message id.
+    /// Remove (dispose) a session. Used by the engine's cleanup sweep; the
+    /// engine records a tombstone so late traffic for it is ignored.
+    pub fn remove_session(&mut self, message_id: &MessageId) {
+        self.sessions.remove(message_id);
+    }
+
     pub fn session_mut(&mut self, message_id: &MessageId) -> Option<&mut Session<S>> {
         self.sessions.get_mut(message_id)
     }

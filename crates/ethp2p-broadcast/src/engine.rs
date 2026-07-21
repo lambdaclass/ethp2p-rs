@@ -17,6 +17,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures::stream::{Stream, StreamExt};
 use prost::Message as _;
@@ -24,9 +26,46 @@ use tokio::sync::mpsc;
 
 use crate::channel::{Channel, ChannelError, ChannelId, MessageId, StrategyFactory};
 use crate::pb::rs::Preamble;
-use crate::runtime::{Net, NetError, NetEvent, NetSend};
+use crate::runtime::{Clock, Net, NetError, NetEvent, NetSend, TokioClock};
 use crate::session::SessionWork;
 use crate::strategy::{PeerId, Strategy};
+
+/// Tunables for session lifecycle and cleanup. Durations default to the
+/// ethp2p reference's values.
+#[derive(Debug, Clone)]
+pub struct EngineConfig {
+    /// Maximum age of a session before it is disposed regardless of state
+    /// (reference `activeSessionTTL`).
+    pub active_session_ttl: Duration,
+    /// Grace period after a session reaches a terminal state (reconstructed
+    /// or failed) before disposal, to absorb straggler chunks.
+    pub reconstructed_linger: Duration,
+    /// How long a disposed session's tombstone is retained — inbound opens or
+    /// chunks for it are ignored — before the tombstone itself is swept.
+    pub tombstone_ttl: Duration,
+    /// Minimum wall/virtual interval between cleanup sweeps (reference
+    /// `cleanupInterval`).
+    pub cleanup_interval: Duration,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            active_session_ttl: Duration::from_secs(5 * 60),
+            reconstructed_linger: Duration::from_secs(10),
+            tombstone_ttl: Duration::from_secs(5 * 60),
+            cleanup_interval: Duration::from_secs(30),
+        }
+    }
+}
+
+/// Per-session lifecycle metadata used by cleanup.
+#[derive(Debug, Clone, Copy)]
+struct SessionMeta {
+    created_at: Instant,
+    /// Set when the session reaches a terminal state (reconstructed/failed).
+    terminal_at: Option<Instant>,
+}
 
 /// Reconstructed payload delivered to the application.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +146,19 @@ pub struct Engine<S: Strategy<RoutingUpdate = crate::strategy::bitmap::BitMap>, 
     /// Peers we have already sent a `SessionOpen` for a given session, so it
     /// is emitted at most once per (session, peer).
     opened_to: BTreeMap<(ChannelId, MessageId), BTreeSet<PeerId>>,
+    /// Cleanup tunables.
+    config: EngineConfig,
+    /// Clock backing session ageing and the cleanup cadence. Injected so the
+    /// sim can drive it deterministically.
+    clock: Arc<dyn Clock>,
+    /// Per-session lifecycle metadata for GC.
+    session_meta: BTreeMap<(ChannelId, MessageId), SessionMeta>,
+    /// Disposed sessions; inbound opens/chunks for them are ignored until the
+    /// tombstone is swept. Prevents a straggling relay from resurrecting a
+    /// finished session.
+    tombstones: BTreeMap<(ChannelId, MessageId), Instant>,
+    /// Time of the next cleanup sweep.
+    next_cleanup: Instant,
 }
 
 impl<S, N> std::fmt::Debug for Engine<S, N>
@@ -128,10 +180,29 @@ where
     S: Strategy<ChunkId = u32, RoutingUpdate = crate::strategy::bitmap::BitMap>,
     N: Net,
 {
-    /// Construct an engine. The `delivered` sink receives reconstructed
-    /// payloads.
+    /// Construct an engine with default cleanup config and a real-time clock.
+    /// The `delivered` sink receives reconstructed payloads.
     pub fn new(local_peer: PeerId, net: N, delivered: mpsc::Sender<DeliveredMessage>) -> Self {
+        Self::with_config(
+            local_peer,
+            net,
+            delivered,
+            EngineConfig::default(),
+            Arc::new(TokioClock),
+        )
+    }
+
+    /// Construct an engine with an explicit cleanup config and clock. The sim
+    /// injects a virtual clock for deterministic ageing.
+    pub fn with_config(
+        local_peer: PeerId,
+        net: N,
+        delivered: mpsc::Sender<DeliveredMessage>,
+        config: EngineConfig,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         let events = net.events();
+        let next_cleanup = clock.now() + config.cleanup_interval;
         Self {
             local_peer,
             local_peer_str: format!("peer-{local_peer}"),
@@ -143,7 +214,19 @@ where
             pending_sends: BTreeMap::new(),
             session_preambles: BTreeMap::new(),
             opened_to: BTreeMap::new(),
+            config,
+            clock,
+            session_meta: BTreeMap::new(),
+            tombstones: BTreeMap::new(),
+            next_cleanup,
         }
+    }
+
+    /// Number of live sessions across all channels. Plateaus once cleanup is
+    /// keeping pace, so it doubles as a memory-health metric.
+    #[must_use]
+    pub fn active_session_count(&self) -> usize {
+        self.session_meta.len()
     }
 
     /// Register a local subscription to `channel_id`. The provided
@@ -215,6 +298,7 @@ where
         // SessionOpen on demand from `drain_session`.
         self.session_preambles
             .insert((channel_id.clone(), message_id.clone()), preamble_bytes);
+        self.record_session_created(channel_id, &message_id);
         // Open SESS streams to all currently-subscribed peers.
         for peer in &subscribers {
             self.ensure_session_open(channel_id, &message_id, *peer)?;
@@ -231,6 +315,10 @@ where
             return Ok(StepResult::Closed);
         };
         self.handle_event(event);
+        // Opportunistic cleanup: piggyback the periodic sweep on event
+        // processing (using the injected clock) rather than a background
+        // timer, so the single event loop and sim determinism are untouched.
+        self.maybe_run_cleanup();
         Ok(StepResult::Processed)
     }
 
@@ -278,6 +366,10 @@ where
                 preamble,
                 ..
             } => {
+                // Ignore a resurrecting open for a session we already disposed.
+                if self.is_tombstoned(&channel, &message_id) {
+                    return;
+                }
                 let opened = match self.channels.get_mut(&channel) {
                     Some(c) => match c.open_session(message_id.clone(), preamble.clone()) {
                         Ok(()) => true,
@@ -293,6 +385,7 @@ where
                     // open a SESS to its own subscribers before forwarding.
                     self.session_preambles
                         .insert((channel.clone(), message_id.clone()), preamble);
+                    self.record_session_created(&channel, &message_id);
                     let _ = self.drain_session(&channel, &message_id);
                 }
             }
@@ -303,6 +396,10 @@ where
                 payload,
                 ..
             } => {
+                // Ignore chunks for a disposed session.
+                if self.is_tombstoned(&channel, &message_id) {
+                    return;
+                }
                 let outcome_complete = match self.channels.get_mut(&channel) {
                     Some(c) => match c.take_chunk(&message_id, chunk_id, payload) {
                         Ok(o) => o.complete,
@@ -526,6 +623,8 @@ where
             Some(session) => session.decode_and_finish(),
             None => return,
         };
+        // Either outcome is terminal; start the disposal clock.
+        self.mark_session_terminal(channel_id, message_id);
         match decoded {
             Ok(payload) => {
                 let _ = self.delivered.try_send(DeliveredMessage {
@@ -563,6 +662,82 @@ where
         {
             session.detach_peer(peer, completed);
         }
+    }
+
+    /// Record the creation time of a session (first open/publish only).
+    fn record_session_created(&mut self, channel: &ChannelId, message_id: &MessageId) {
+        self.session_meta
+            .entry((channel.clone(), message_id.clone()))
+            .or_insert_with(|| SessionMeta {
+                created_at: self.clock.now(),
+                terminal_at: None,
+            });
+    }
+
+    /// Mark a session terminal (reconstructed or failed), starting the
+    /// disposal linger.
+    fn mark_session_terminal(&mut self, channel: &ChannelId, message_id: &MessageId) {
+        if let Some(meta) = self
+            .session_meta
+            .get_mut(&(channel.clone(), message_id.clone()))
+        {
+            meta.terminal_at.get_or_insert_with(|| self.clock.now());
+        }
+    }
+
+    /// Whether `(channel, message_id)` was recently disposed and its
+    /// tombstone still stands.
+    fn is_tombstoned(&self, channel: &ChannelId, message_id: &MessageId) -> bool {
+        self.tombstones
+            .contains_key(&(channel.clone(), message_id.clone()))
+    }
+
+    /// Run a cleanup sweep if the interval has elapsed.
+    fn maybe_run_cleanup(&mut self) {
+        let now = self.clock.now();
+        if now < self.next_cleanup {
+            return;
+        }
+        self.next_cleanup = now + self.config.cleanup_interval;
+        self.run_cleanup(now);
+    }
+
+    /// Dispose sessions past their TTL or terminal linger, and expire old
+    /// tombstones. Keeps engine memory bounded for a long-running node.
+    fn run_cleanup(&mut self, now: Instant) {
+        let ttl = self.config.active_session_ttl;
+        let linger = self.config.reconstructed_linger;
+        let expired: Vec<(ChannelId, MessageId)> = self
+            .session_meta
+            .iter()
+            .filter(|(_, m)| {
+                now.saturating_duration_since(m.created_at) > ttl
+                    || m.terminal_at
+                        .is_some_and(|t| now.saturating_duration_since(t) > linger)
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for (channel, message_id) in expired {
+            self.dispose_session(&channel, &message_id, now);
+        }
+        let tombstone_ttl = self.config.tombstone_ttl;
+        self.tombstones
+            .retain(|_, at| now.saturating_duration_since(*at) <= tombstone_ttl);
+    }
+
+    /// Drop all state for a session and leave a tombstone so late opens or
+    /// chunks for it are ignored.
+    fn dispose_session(&mut self, channel: &ChannelId, message_id: &MessageId, now: Instant) {
+        let key = (channel.clone(), message_id.clone());
+        if let Some(c) = self.channels.get_mut(channel) {
+            c.remove_session(message_id);
+        }
+        self.session_meta.remove(&key);
+        self.session_preambles.remove(&key);
+        self.opened_to.remove(&key);
+        self.pending_sends
+            .retain(|(c, m, _), _| !(c == channel && m == message_id));
+        self.tombstones.insert(key, now);
     }
 }
 
