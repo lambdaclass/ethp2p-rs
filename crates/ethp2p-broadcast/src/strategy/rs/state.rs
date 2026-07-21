@@ -248,6 +248,11 @@ impl Strategy for RsStrategy {
         // Drop any in-flight handles bound to this peer; the engine
         // will not call chunk_sent for them after detach.
         self.in_flight.retain(|_h, (p, _idx)| *p != peer);
+        // Clear the planner's per-peer state (optimistic havelist, in-flight
+        // set) and refund the budget of any shards still in-flight to the
+        // departed peer, so relays don't leak forward-multiplier budget across
+        // disconnects.
+        self.planner.remove_peer(peer);
     }
 
     fn routing_update(&mut self, peer: PeerId, update: BitMap) -> Vec<DispatchHandle> {
@@ -325,7 +330,11 @@ impl Strategy for RsStrategy {
             if ok {
                 self.planner.record_sent(peer, idx);
             } else {
+                // A send that never reached the wire: clear the in-flight
+                // marker and refund the allocation so the shard's budget is
+                // reclaimed (matches the reference's failed-send refund).
                 self.planner.cancel_in_flight(peer, idx);
+                self.planner.refund_allocation(idx);
             }
         }
     }
