@@ -78,78 +78,87 @@ The generated module paths are:
 ### Requirement: Length-prefixed protobuf framing for BCAST and SESS streams
 
 The codec SHALL provide async read and write helpers that frame protobuf
-messages as a Protobuf-varint length prefix followed by the encoded
-message bytes. The framing is used on BCAST and SESS streams per
-`specs/002-ec-broadcast.md` §3.
+messages as a **4-byte big-endian `u32`** length prefix followed by the
+encoded message bytes. The framing is used on BCAST and SESS streams per
+`specs/002-ec-broadcast.md` §3 and matches the reference `broadcast/wire.go`
+byte-for-byte (interop requirement).
 
-The varint format is the standard Protobuf varint (LEB128-style as
-emitted by `prost`'s length-delimited helpers).
+Frames whose declared length exceeds the reference `MaxFrameSize` of
+**1 MiB** SHALL be rejected before any payload bytes are read or written.
 
-#### Scenario: Writer emits varint-prefixed message
+#### Scenario: Writer emits length-prefixed message
 
 - **WHEN** a writer calls `write_framed(message)` where
   `message.encoded_len() == N`
 - **THEN** the bytes written to the underlying stream are
-  `varint(N) || encoded_bytes`
+  `u32_be(N) || encoded_bytes`
 
-#### Scenario: Reader decodes varint-prefixed message
+#### Scenario: Reader decodes length-prefixed message
 
 - **WHEN** a reader receives a stream whose next bytes are
-  `varint(N) || encoded_bytes` for an N-byte protobuf message
+  `u32_be(N) || encoded_bytes` for an N-byte protobuf message
 - **THEN** `read_framed(reader)` returns the decoded message and consumes
-  exactly `varint_byte_count + N` bytes from the stream
+  exactly `4 + N` bytes from the stream
+
+#### Scenario: Reader rejects oversize frame
+
+- **WHEN** a reader receives a length prefix declaring more than 1 MiB
+- **THEN** `read_framed` returns an error and reads no payload bytes
 
 #### Scenario: Reader detects truncated frame
 
-- **WHEN** a reader receives `varint(N)` followed by fewer than `N` bytes
+- **WHEN** a reader receives `u32_be(N)` followed by fewer than `N` bytes
   before EOF
 - **THEN** `read_framed` returns an error describing the truncation; the
   reader is not advanced beyond the bytes already consumed
 
 ### Requirement: Stream-opening protocol selector
 
-Every ethp2p stream SHALL begin with a single length-prefixed
-`Selector` message identifying the stream's protocol type
-(`BCAST`/`SESS`/`CHUNK`). The codec SHALL expose helpers to write the
-selector at stream open and read-and-dispatch the selector on accept.
+Every ethp2p stream SHALL begin with **exactly one raw byte** whose value
+is the `Protocol` enum discriminant (`BCAST`=1/`SESS`=2/`CHUNK`=3),
+matching the reference `protocol.WriteSelector`. The byte is not
+length-prefixed, and the `Selector` protobuf message is never placed on
+the wire. The codec SHALL expose helpers to write the selector byte at
+stream open and read-and-dispatch it on accept.
 
-A stream whose selector is malformed, missing, or carries
-`PROTOCOL_UNSPECIFIED` SHALL be rejected by the reader.
+A stream whose selector byte is `0` (`PROTOCOL_UNSPECIFIED`) or an
+unrecognized value SHALL be rejected by the reader.
 
 #### Scenario: Writer opens a BCAST stream
 
 - **WHEN** a writer calls `open_stream(writer, Protocol::Bcast)`
-- **THEN** the bytes written are `varint(2) || encoded(Selector { protocol:
-  PROTOCOL_BCAST })` and the writer is positioned to write further
-  framed BCAST frames
+- **THEN** the single byte `0x01` is written and the writer is positioned
+  to write further framed BCAST frames
 
 #### Scenario: Reader dispatches an incoming stream
 
 - **WHEN** a reader calls `read_selector(reader)` on an inbound stream
-  whose first frame decodes to `Selector { protocol: PROTOCOL_SESS }`
+  whose first byte is `0x02`
 - **THEN** the helper returns `Protocol::Sess` and the reader is
   positioned to read further framed SESS frames
 
 #### Scenario: Reader rejects unknown selector
 
-- **WHEN** a reader calls `read_selector(reader)` and the first frame
-  carries `PROTOCOL_UNSPECIFIED` or fails to decode
+- **WHEN** a reader calls `read_selector(reader)` and the first byte is
+  `0` or an unrecognized value
 - **THEN** the helper returns an error describing the rejection; the
   caller is expected to cancel the stream
 
 ### Requirement: CHUNK stream layout
 
 CHUNK streams SHALL be laid out as `Selector || Chunk.Header || raw_bytes`,
-where `Chunk.Header` is length-prefixed and `raw_bytes` is exactly
-`Chunk.Header.data_length` bytes that follow with no further framing.
-This matches `specs/002-ec-broadcast.md` §6.
+where the selector is the single `CHUNK` byte, `Chunk.Header` is a
+length-prefixed frame, and `raw_bytes` is exactly `Chunk.Header.data_length`
+bytes that follow with no further framing. A `data_length` exceeding the
+reference `maxChunkDataSize` of **1 MiB** SHALL be rejected. This matches
+`specs/002-ec-broadcast.md` §6.
 
 #### Scenario: Writer emits a chunk stream
 
 - **WHEN** a writer calls `write_chunk(writer, header, &payload)` where
   `header.data_length == payload.len() == K`
 - **THEN** the bytes written are
-  `Selector(CHUNK) || varint(header.encoded_len()) || encoded(header) || payload`,
+  `0x03 || u32_be(header.encoded_len()) || encoded(header) || payload`,
   in that order, with no additional bytes appended
 
 #### Scenario: Reader returns header and bounded payload reader

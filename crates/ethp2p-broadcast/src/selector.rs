@@ -1,43 +1,41 @@
 //! Stream-opening protocol selector.
 //!
-//! Every ethp2p stream begins with a length-prefixed [`Selector`] frame
-//! identifying the stream's protocol type (BCAST, SESS, or CHUNK), per
-//! `specs/002-ec-broadcast.md` §3. This module exposes helpers to write
-//! the selector at stream open and read-and-dispatch on the receive side.
+//! Every ethp2p stream begins with **exactly one raw byte** whose value is
+//! the [`Protocol`] enum discriminant (BCAST=1, SESS=2, CHUNK=3), per
+//! `specs/002-ec-broadcast.md` §3 and the Go reference `protocol.WriteSelector`.
+//! The byte is not length-prefixed and the `Selector` protobuf message is
+//! never placed on the wire — it exists only in the generated schema.
+//! Streams whose selector is `0` (unspecified) or an unknown value are
+//! rejected by the reader; the dispatch layer cancels such streams.
 
 use std::io;
 
-use ethp2p_protocol::pb::{Protocol, Selector};
-use tokio::io::{AsyncRead, AsyncWrite};
+use ethp2p_protocol::pb::Protocol;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::wire::{read_framed, write_framed};
-
-/// Writes a length-prefixed [`Selector`] frame identifying the given
-/// `protocol`. The writer is then positioned to write further framed
-/// messages of the corresponding stream type.
+/// Writes the single-byte protocol selector for `protocol`. The writer is
+/// then positioned to write the stream-type's framed messages.
 pub async fn open_stream<W>(writer: &mut W, protocol: Protocol) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    let selector = Selector {
-        protocol: protocol as i32,
-    };
-    write_framed(writer, &selector).await
+    writer.write_all(&[protocol as u8]).await
 }
 
-/// Reads the opening selector frame and returns the declared protocol.
+/// Reads the single opening selector byte and returns the declared protocol.
 ///
-/// Rejects [`Protocol::Unspecified`] and unrecognized protocol numbers
-/// with [`io::ErrorKind::InvalidData`].
+/// Rejects [`Protocol::Unspecified`] and unrecognized values with
+/// [`io::ErrorKind::InvalidData`].
 pub async fn read_selector<R>(reader: &mut R) -> io::Result<Protocol>
 where
     R: AsyncRead + Unpin,
 {
-    let selector: Selector = read_framed(reader).await?;
-    let protocol = Protocol::try_from(selector.protocol).map_err(|_| {
+    let mut byte = [0_u8; 1];
+    reader.read_exact(&mut byte).await?;
+    let protocol = Protocol::try_from(i32::from(byte[0])).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("unknown protocol: {}", selector.protocol),
+            format!("unknown protocol selector: {}", byte[0]),
         )
     })?;
     if protocol == Protocol::Unspecified {
@@ -53,6 +51,16 @@ where
 mod tests {
     use super::*;
     use tokio::io::{duplex, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn selector_is_a_single_raw_byte() {
+        let (mut a, mut b) = duplex(64);
+        open_stream(&mut a, Protocol::Sess).await.unwrap();
+        drop(a);
+        let mut got = Vec::new();
+        AsyncReadExt::read_to_end(&mut b, &mut got).await.unwrap();
+        assert_eq!(got, [Protocol::Sess as u8]); // exactly one byte, value 2
+    }
 
     #[tokio::test]
     async fn roundtrip_each_variant() {
@@ -76,10 +84,9 @@ mod tests {
 
     #[tokio::test]
     async fn reject_unknown_protocol_number() {
-        // Hand-write a Selector with protocol=99.
         let (mut a, mut b) = duplex(64);
-        let selector = Selector { protocol: 99 };
-        crate::wire::write_framed(&mut a, &selector).await.unwrap();
+        a.write_all(&[99]).await.unwrap();
+        drop(a);
         let err = read_selector(&mut b)
             .await
             .expect_err("unknown protocol must be rejected");
@@ -87,11 +94,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reject_random_bytes() {
-        let (mut a, mut b) = duplex(64);
-        a.write_all(&[0xff; 16]).await.unwrap();
+    async fn reject_empty_stream() {
+        let (a, mut b) = duplex(64);
         drop(a);
         let result = read_selector(&mut b).await;
-        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
     }
 }
