@@ -92,6 +92,21 @@ impl Net for MemoryNetEndpoint {
             | NetSend::Chunk { peer, .. } => *peer,
         };
 
+        // Capture chunk correlation before `msg` is consumed, so we can echo
+        // a `ChunkSendResult` back to ourselves. The real transport reports a
+        // chunk's honest outcome; the in-process net always succeeds (network
+        // loss is modelled elsewhere and is not a send failure).
+        let chunk_ack = match &msg {
+            NetSend::Chunk {
+                peer,
+                channel,
+                message_id,
+                token,
+                ..
+            } => Some((*peer, channel.clone(), message_id.clone(), *token)),
+            _ => None,
+        };
+
         let event = match msg {
             NetSend::Handshake {
                 version,
@@ -153,7 +168,22 @@ impl Net for MemoryNetEndpoint {
 
         let map = self.senders.lock().expect("hub mutex");
         let tx = map.get(&dst).ok_or(NetError::PeerNotFound(dst))?;
-        tx.send(event).map_err(|_| NetError::Closed)
+        tx.send(event).map_err(|_| NetError::Closed)?;
+
+        // Report the chunk's send outcome back to ourselves (always ok on the
+        // in-process net) so the sender's engine can resolve its deferred ack.
+        if let Some((peer, channel, message_id, token)) = chunk_ack {
+            if let Some(self_tx) = map.get(&self.peer_id) {
+                let _ = self_tx.send(NetEvent::ChunkSendResult {
+                    peer,
+                    channel,
+                    message_id,
+                    token,
+                    ok: true,
+                });
+            }
+        }
+        Ok(())
     }
 
     fn events(&self) -> Pin<Box<dyn Stream<Item = NetEvent> + Send + 'static>> {
@@ -183,6 +213,7 @@ mod tests {
             message_id: "msg".into(),
             chunk_id: 7,
             payload: vec![1, 2, 3],
+            token: 0,
         })
         .unwrap();
 
@@ -218,6 +249,7 @@ mod tests {
                 message_id: "msg".into(),
                 chunk_id: n,
                 payload: vec![],
+                token: 0,
             })
             .unwrap();
         }
@@ -240,6 +272,7 @@ mod tests {
                 message_id: "msg".into(),
                 chunk_id: 0,
                 payload: vec![],
+                token: 0,
             })
             .unwrap_err();
         assert_eq!(err, NetError::PeerNotFound(99));

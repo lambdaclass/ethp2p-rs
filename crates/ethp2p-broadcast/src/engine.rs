@@ -94,6 +94,11 @@ pub struct Engine<S: Strategy<RoutingUpdate = crate::strategy::bitmap::BitMap>, 
     delivered: mpsc::Sender<DeliveredMessage>,
     net: N,
     events: Pin<Box<dyn Stream<Item = NetEvent> + Send + 'static>>,
+    /// Chunks dispatched to the wire and awaiting their honest outcome.
+    /// Key `(channel, message_id, token)` where `token` is the session
+    /// dispatch handle passed in [`NetSend::Chunk`]; value is the target
+    /// peer. Resolved (and removed) by [`NetEvent::ChunkSendResult`].
+    pending_sends: BTreeMap<(ChannelId, MessageId, u64), PeerId>,
 }
 
 impl<S, N> std::fmt::Debug for Engine<S, N>
@@ -127,6 +132,7 @@ where
             delivered,
             net,
             events,
+            pending_sends: BTreeMap::new(),
         }
     }
 
@@ -153,8 +159,16 @@ where
         Ok(())
     }
 
-    /// Register a peer connection and send the BCAST handshake.
+    /// Register a peer connection and send the BCAST handshake. Called
+    /// directly by the sim/tests; the transport instead reports
+    /// [`NetEvent::PeerConnected`], which drives the same path.
     pub fn connect(&mut self, peer: PeerId) -> Result<(), EngineError> {
+        self.register_peer_and_handshake(peer)
+    }
+
+    /// Mark `peer` connected and send it our handshake. Idempotent: a
+    /// second call for an already-connected peer is a no-op.
+    fn register_peer_and_handshake(&mut self, peer: PeerId) -> Result<(), EngineError> {
         if !self.connected.insert(peer) {
             return Ok(());
         }
@@ -293,10 +307,51 @@ where
             }
             NetEvent::PeerDisconnected { peer } => {
                 self.connected.remove(&peer);
+                self.pending_sends.retain(|_k, p| *p != peer);
                 for c in self.channels.values_mut() {
                     c.unsubscribe_peer(peer);
                 }
             }
+            NetEvent::PeerConnected { peer } => {
+                // A transport connection is up; respond with our handshake
+                // (the sim/tests reach the same path via `connect`).
+                let _ = self.register_peer_and_handshake(peer);
+            }
+            NetEvent::ChunkSendResult {
+                peer,
+                channel,
+                message_id,
+                token,
+                ok,
+            } => self.resolve_chunk_send(peer, &channel, &message_id, token, ok),
+        }
+    }
+
+    /// Resolve a deferred chunk send reported via [`NetEvent::ChunkSendResult`]:
+    /// feed the honest outcome to the session's `chunk_sent` and re-drain so a
+    /// freed (or refunded) allocation is re-planned. Results with no matching
+    /// pending entry (a duplicate, or one purged by a disconnect) are ignored.
+    fn resolve_chunk_send(
+        &mut self,
+        peer: PeerId,
+        channel: &ChannelId,
+        message_id: &MessageId,
+        token: u64,
+        ok: bool,
+    ) {
+        if self
+            .pending_sends
+            .remove(&(channel.clone(), message_id.clone(), token))
+            .is_some()
+        {
+            if let Some(session) = self
+                .channels
+                .get_mut(channel)
+                .and_then(|c| c.session_mut(message_id))
+            {
+                session.chunk_sent(peer, token, ok);
+            }
+            let _ = self.drain_session(channel, message_id);
         }
     }
 
@@ -358,19 +413,35 @@ where
 
             for d in work.dispatches {
                 let chunk_id: u32 = d.chunk_id;
+                let token = d.handle;
                 let result = self.net.send(NetSend::Chunk {
                     peer: d.peer,
                     channel: channel_id.clone(),
                     message_id: message_id.clone(),
                     chunk_id,
                     payload: d.payload,
+                    token,
                 });
-                if let Some(session) = self
-                    .channels
-                    .get_mut(channel_id)
-                    .and_then(|c| c.session_mut(message_id))
-                {
-                    session.chunk_sent(d.peer, d.handle, result.is_ok());
+                match result {
+                    // The chunk entered the transport. Defer the ack: its
+                    // honest outcome arrives later as `ChunkSendResult`
+                    // carrying `token`, at which point we call `chunk_sent`.
+                    Ok(()) => {
+                        self.pending_sends
+                            .insert((channel_id.clone(), message_id.clone(), token), d.peer);
+                    }
+                    // The send never reached the wire (peer unknown, queue
+                    // full). Resolve the in-flight allocation as failed now
+                    // so the strategy refunds and re-plans.
+                    Err(_) => {
+                        if let Some(session) = self
+                            .channels
+                            .get_mut(channel_id)
+                            .and_then(|c| c.session_mut(message_id))
+                        {
+                            session.chunk_sent(d.peer, d.handle, false);
+                        }
+                    }
                 }
             }
         }

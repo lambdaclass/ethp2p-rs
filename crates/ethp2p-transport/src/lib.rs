@@ -206,6 +206,9 @@ fn dest_peer(msg: &NetSend) -> PeerId {
         | NetSend::SessionOpen { peer, .. }
         | NetSend::RoutingUpdate { peer, .. }
         | NetSend::Chunk { peer, .. } => *peer,
+        // `NetSend` is non-exhaustive; this demo transport is superseded by
+        // the spec transport and never emits newer variants.
+        other => unreachable!("demo transport: unhandled NetSend {other:?}"),
     }
 }
 
@@ -420,6 +423,9 @@ async fn write_record(stream: &mut SendStream, msg: &NetSend) -> io::Result<()> 
             write_framed(stream, &header).await?;
             stream.write_all(payload).await?;
         }
+        // `NetSend` is non-exhaustive; this demo transport (superseded by the
+        // spec transport) does not emit newer variants.
+        _ => {}
     }
     Ok(())
 }

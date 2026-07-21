@@ -60,6 +60,7 @@ impl MsgKind {
             NetSend::Chunk { chunk_id, .. } => Self::Chunk {
                 chunk_id: *chunk_id,
             },
+            other => unreachable!("sim MsgKind: unhandled NetSend {other:?}"),
         }
     }
 }
