@@ -79,7 +79,10 @@ use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
+pub mod config;
 mod tls;
+
+pub use config::QuicNetConfig;
 
 const KIND_HANDSHAKE: u8 = 1;
 const KIND_SUBSCRIBE: u8 = 2;
@@ -115,8 +118,37 @@ impl QuicNet {
     /// Spawns the accept loop (inbound connections) and the outbound pump
     /// (drains `send` calls onto QUIC streams).
     pub fn bind(local_peer: PeerId, bind_addr: SocketAddr) -> io::Result<Self> {
-        let mut endpoint = Endpoint::server(tls::server_config()?, bind_addr)?;
-        endpoint.set_default_client_config(tls::client_config()?);
+        Self::bind_with_config(local_peer, bind_addr, QuicNetConfig::default())
+    }
+
+    /// [`Self::bind`] with explicit transport configuration (ALPN, QUIC
+    /// idle timeout and keep-alive).
+    pub fn bind_with_config(
+        local_peer: PeerId,
+        bind_addr: SocketAddr,
+        config: QuicNetConfig,
+    ) -> io::Result<Self> {
+        let QuicNetConfig {
+            alpn,
+            max_idle_timeout,
+            keep_alive_interval,
+        } = config;
+        // Shared QUIC transport config: keep-alive under the idle timeout so a
+        // silent-but-live connection stays up while a vanished peer is detected
+        // promptly.
+        let transport = {
+            let mut t = quinn::TransportConfig::default();
+            let idle = quinn::IdleTimeout::try_from(max_idle_timeout).map_err(io::Error::other)?;
+            t.max_idle_timeout(Some(idle));
+            t.keep_alive_interval(Some(keep_alive_interval));
+            Arc::new(t)
+        };
+        let mut server = tls::server_config(&alpn)?;
+        server.transport_config(Arc::clone(&transport));
+        let mut endpoint = Endpoint::server(server, bind_addr)?;
+        let mut client = tls::client_config(&alpn)?;
+        client.transport_config(transport);
+        endpoint.set_default_client_config(client);
 
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<NetSend>();
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<NetEvent>();
