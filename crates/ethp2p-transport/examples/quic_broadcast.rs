@@ -7,8 +7,8 @@
 //!
 //! Run with: `cargo run -p ethp2p-transport --example quic_broadcast`
 //!
-//! This is a demo / proof-of-concept, not the spec-conformant slice 7.
-//! See the crate docs for the (provisional) wire framing.
+//! Runs over the spec-conformant wire (per-protocol BCAST/SESS/CHUNK streams);
+//! see the crate docs for the framing.
 
 #![allow(clippy::cast_possible_truncation, clippy::format_collect)]
 
@@ -24,8 +24,10 @@ use prost::Message as _;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
-const ORIGIN_PEER: u64 = 1;
-const RELAY_PEER: u64 = 2;
+// Engine-local identities (the `peer-N` handshake string + logging). The
+// transport mints its own per-connection ids.
+const ORIGIN_SELF: u64 = 100;
+const RELAY_SELF: u64 = 200;
 const CHANNEL: &str = "demo";
 const MESSAGE_ID: &str = "msg-0001";
 
@@ -64,28 +66,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Bind two QUIC endpoints on ephemeral loopback ports.
     let loopback = |port| SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let relay_net = QuicNet::bind(RELAY_PEER, loopback(0))?;
+    let relay_net = QuicNet::bind(loopback(0))?;
     let relay_addr = relay_net.local_addr()?;
-    let origin_net = QuicNet::bind(ORIGIN_PEER, loopback(0))?;
+    let origin_net = QuicNet::bind(loopback(0))?;
     let origin_addr = origin_net.local_addr()?;
-    println!("▶ origin {ORIGIN_PEER} @ {origin_addr}   relay {RELAY_PEER} @ {relay_addr}");
+    println!("▶ origin @ {origin_addr}   relay @ {relay_addr}");
 
-    // Establish the QUIC connection: origin dials the relay.
-    origin_net.connect(RELAY_PEER, relay_addr).await?;
+    // Establish the QUIC connection: origin dials the relay. Both endpoints
+    // emit `PeerConnected`, which drives each engine's handshake.
+    origin_net.connect(relay_addr).await?;
     println!("▶ QUIC connection established (origin → relay)");
 
     let (origin_delivered_tx, _origin_delivered_rx) = mpsc::channel(8);
     let (relay_delivered_tx, mut relay_delivered_rx) = mpsc::channel(8);
 
-    let mut origin = Engine::new(ORIGIN_PEER, origin_net, origin_delivered_tx);
-    let mut relay = Engine::new(RELAY_PEER, relay_net, relay_delivered_tx);
+    let mut origin = Engine::new(ORIGIN_SELF, origin_net, origin_delivered_tx);
+    let mut relay = Engine::new(RELAY_SELF, relay_net, relay_delivered_tx);
 
     origin.subscribe(CHANNEL.into(), rs_relay_factory(config))?;
     relay.subscribe(CHANNEL.into(), rs_relay_factory(config))?;
-
-    // App-level handshakes in both directions.
-    origin.connect(RELAY_PEER)?;
-    relay.connect(ORIGIN_PEER)?;
 
     let driver = async {
         let mut published = false;
