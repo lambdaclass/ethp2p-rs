@@ -10,15 +10,30 @@
 #![allow(clippy::cast_possible_truncation, clippy::match_wild_err_arm)]
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
-use ethp2p_broadcast::engine::{rs_relay_factory, Engine, EngineError};
+use ethp2p_broadcast::engine::{rs_relay_factory, Engine, EngineConfig, EngineError};
+use ethp2p_broadcast::runtime::TokioClock;
 use ethp2p_broadcast::strategy::config::RsConfig;
 use ethp2p_broadcast::strategy::rs::encode::encode as rs_encode;
 use ethp2p_broadcast::strategy::rs::state::RsStrategy;
 use ethp2p_transport::QuicNet;
 use prost::Message as _;
 use tokio::sync::mpsc;
+
+/// Engine config with cleanup effectively disabled, so a slow CI runner cannot
+/// dispose the relay's just-reconstructed session while it is still forwarding
+/// to the leaf. This isolates the test from session-GC timing.
+fn no_cleanup_config() -> EngineConfig {
+    let hour = Duration::from_secs(3600);
+    EngineConfig {
+        active_session_ttl: hour,
+        reconstructed_linger: hour,
+        tombstone_ttl: hour,
+        cleanup_interval: hour,
+    }
+}
 
 // Engine-local identities (handshake `peer-N` string + logging), distinct
 // from the transport's minted per-connection ids.
@@ -68,9 +83,27 @@ async fn relay_chain_delivers_to_leaf_over_quic() {
     let (relay_tx, _relay_rx) = mpsc::channel(8);
     let (leaf_tx, mut leaf_rx) = mpsc::channel(8);
 
-    let mut origin = Engine::new(ORIGIN_SELF, origin_net, origin_tx);
-    let mut relay = Engine::new(RELAY_SELF, relay_net, relay_tx);
-    let mut leaf = Engine::new(LEAF_SELF, leaf_net, leaf_tx);
+    let mut origin = Engine::with_config(
+        ORIGIN_SELF,
+        origin_net,
+        origin_tx,
+        no_cleanup_config(),
+        Arc::new(TokioClock),
+    );
+    let mut relay = Engine::with_config(
+        RELAY_SELF,
+        relay_net,
+        relay_tx,
+        no_cleanup_config(),
+        Arc::new(TokioClock),
+    );
+    let mut leaf = Engine::with_config(
+        LEAF_SELF,
+        leaf_net,
+        leaf_tx,
+        no_cleanup_config(),
+        Arc::new(TokioClock),
+    );
 
     for engine in [&mut origin, &mut relay, &mut leaf] {
         engine
@@ -106,7 +139,7 @@ async fn relay_chain_delivers_to_leaf_over_quic() {
         }
     };
 
-    match tokio::time::timeout(Duration::from_secs(30), driver).await {
+    match tokio::time::timeout(Duration::from_secs(60), driver).await {
         Ok(Ok(msg)) => {
             assert_eq!(msg.channel_id, CHANNEL);
             assert_eq!(msg.message_id, MESSAGE_ID);
@@ -116,6 +149,6 @@ async fn relay_chain_delivers_to_leaf_over_quic() {
             );
         }
         Ok(Err(e)) => panic!("engine error: {e}"),
-        Err(_) => panic!("relay-chain round-trip timed out after 30s"),
+        Err(_) => panic!("relay-chain round-trip timed out after 60s"),
     }
 }

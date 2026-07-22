@@ -57,6 +57,12 @@ mod tls;
 
 pub use config::QuicNetConfig;
 
+/// Uni-stream credit advertised to each peer. Every chunk rides its own
+/// unidirectional stream, so a broadcast burst opens many at once; ample
+/// credit keeps the sender's pump from blocking in `open_uni` (which would
+/// stall the ack-gated drain) while the receiver drains earlier chunk streams.
+const MAX_CONCURRENT_UNI_STREAMS: u32 = 4096;
+
 type ConnMap = Arc<Mutex<HashMap<PeerId, Connection>>>;
 
 /// A [`Net`] backed by real QUIC connections speaking the ethp2p spec wire.
@@ -99,6 +105,7 @@ impl QuicNet {
             let idle = quinn::IdleTimeout::try_from(max_idle_timeout).map_err(io::Error::other)?;
             t.max_idle_timeout(Some(idle));
             t.keep_alive_interval(Some(keep_alive_interval));
+            t.max_concurrent_uni_streams(MAX_CONCURRENT_UNI_STREAMS.into());
             Arc::new(t)
         };
         let mut server = tls::server_config(&alpn)?;
