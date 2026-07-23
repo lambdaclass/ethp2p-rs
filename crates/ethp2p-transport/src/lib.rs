@@ -29,10 +29,18 @@
 //! `0x01`) or [`NetEvent::SessionClosed`] (any other stop code); the engine
 //! detaches that peer from the session so no further chunks are planned to it.
 //!
+//! ## Backpressure
+//!
+//! Each peer has its own bounded outbound queue drained by a dedicated pump, so
+//! one slow peer never head-of-line-blocks the others. When a queue is full,
+//! [`Net::send`] returns [`NetError::Backpressure`]: the engine refunds a chunk
+//! and reroutes it, and retries a control frame on its next drain. The inbound
+//! event queue is currently unbounded.
+//!
 //! ## Deferred to later slices
 //!
-//! - **Hardening.** Peer authentication / SPKI pinning and bounded per-peer
-//!   queues are the hardening slice; queues here are unbounded.
+//! - **Hardening.** Peer authentication / SPKI pinning is the security slice;
+//!   the inbound event queue is not yet bounded.
 
 #![allow(clippy::module_name_repetitions)]
 
@@ -144,15 +152,25 @@ impl ResetState {
 /// stall the ack-gated drain) while the receiver drains earlier chunk streams.
 const MAX_CONCURRENT_UNI_STREAMS: u32 = 4096;
 
-type ConnMap = Arc<Mutex<HashMap<PeerId, Connection>>>;
+/// Depth of each peer's bounded outbound queue. A full queue means that peer's
+/// pump is not keeping up: a `Chunk` then fails with [`NetError::Backpressure`]
+/// so the strategy reroutes, and (rare) control frames are likewise refused and
+/// retried on the engine's next drain. Per-peer queues also stop one slow peer
+/// from head-of-line-blocking sends to the others. Sized so ordinary broadcast
+/// bursts never fill it.
+const PER_PEER_OUTBOUND_QUEUE: usize = 256;
+
+/// Routing table: local peer id → the sender half of that peer's bounded
+/// outbound queue. Populated on connect/accept, removed on disconnect; also
+/// serves as the "is this peer connected" registry.
+type PeerSenders = Arc<Mutex<HashMap<PeerId, mpsc::Sender<NetSend>>>>;
 
 /// A [`Net`] backed by real QUIC connections speaking the ethp2p spec wire.
 pub struct QuicNet {
     endpoint: Endpoint,
-    outbound_tx: mpsc::UnboundedSender<NetSend>,
     inbound_tx: mpsc::UnboundedSender<NetEvent>,
     inbound_rx: Mutex<Option<mpsc::UnboundedReceiver<NetEvent>>>,
-    conns: ConnMap,
+    peer_senders: PeerSenders,
     next_peer_id: Arc<AtomicU64>,
     reset: Arc<ResetState>,
 }
@@ -197,17 +215,16 @@ impl QuicNet {
         client.transport_config(transport);
         endpoint.set_default_client_config(client);
 
-        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<NetSend>();
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<NetEvent>();
-        let conns: ConnMap = Arc::new(Mutex::new(HashMap::new()));
+        let peer_senders: PeerSenders = Arc::new(Mutex::new(HashMap::new()));
         let next_peer_id = Arc::new(AtomicU64::new(1));
         let reset = Arc::new(ResetState::default());
 
-        // Accept loop: assign each inbound connection a local peer id and read
-        // its streams.
+        // Accept loop: assign each inbound connection a local peer id, then
+        // spawn its per-peer outbound pump and inbound reader.
         {
             let endpoint = endpoint.clone();
-            let conns = Arc::clone(&conns);
+            let peer_senders = Arc::clone(&peer_senders);
             let inbound_tx = inbound_tx.clone();
             let next_peer_id = Arc::clone(&next_peer_id);
             let reset = Arc::clone(&reset);
@@ -216,7 +233,7 @@ impl QuicNet {
                     match incoming.await {
                         Ok(conn) => {
                             let peer = next_peer_id.fetch_add(1, Ordering::Relaxed);
-                            register_peer(&conns, peer, conn.clone(), &inbound_tx, &reset);
+                            register_peer(&peer_senders, peer, conn, &inbound_tx, &reset);
                         }
                         Err(e) => tracing::debug!(?e, "inbound connection failed"),
                     }
@@ -224,20 +241,11 @@ impl QuicNet {
             });
         }
 
-        // Single outbound pump: owns per-peer stream state and writes frames.
-        tokio::spawn(outbound_pump(
-            outbound_rx,
-            Arc::clone(&conns),
-            inbound_tx.clone(),
-            Arc::clone(&reset),
-        ));
-
         Ok(Self {
             endpoint,
-            outbound_tx,
             inbound_tx,
             inbound_rx: Mutex::new(Some(inbound_rx)),
-            conns,
+            peer_senders,
             next_peer_id,
             reset,
         })
@@ -258,7 +266,13 @@ impl QuicNet {
             .map_err(io::Error::other)?;
         let conn = connecting.await.map_err(io::Error::other)?;
         let peer = self.next_peer_id.fetch_add(1, Ordering::Relaxed);
-        register_peer(&self.conns, peer, conn, &self.inbound_tx, &self.reset);
+        register_peer(
+            &self.peer_senders,
+            peer,
+            conn,
+            &self.inbound_tx,
+            &self.reset,
+        );
         Ok(peer)
     }
 
@@ -270,7 +284,36 @@ impl QuicNet {
 
 impl Net for QuicNet {
     fn send(&self, msg: NetSend) -> Result<(), NetError> {
-        self.outbound_tx.send(msg).map_err(|_| NetError::Closed)
+        // Local reconstruct: record + wake inbound SESS readers, no peer route.
+        if let NetSend::SessionReconstructed {
+            channel,
+            message_id,
+        } = msg
+        {
+            self.reset.record((channel, message_id));
+            return Ok(());
+        }
+        let Some(dst) = dest_peer(&msg) else {
+            return Ok(());
+        };
+        let sender = self
+            .peer_senders
+            .lock()
+            .expect("peer_senders")
+            .get(&dst)
+            .cloned();
+        let Some(sender) = sender else {
+            return Err(NetError::PeerNotFound(dst));
+        };
+        // Non-blocking enqueue onto the peer's bounded queue. A full queue is
+        // backpressure — the engine refunds a chunk and reroutes, or retries a
+        // control frame on its next drain; a closed queue means the peer's pump
+        // has stopped (disconnect in flight).
+        match sender.try_send(msg) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(NetError::Backpressure(dst)),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(NetError::PeerNotFound(dst)),
+        }
     }
 
     fn events(&self) -> Pin<Box<dyn Stream<Item = NetEvent> + Send + 'static>> {
@@ -284,24 +327,26 @@ impl Net for QuicNet {
     }
 }
 
-/// Register a freshly established connection: record it, announce
-/// `PeerConnected`, and spawn its inbound reader.
+/// Register a freshly established connection: create its bounded outbound
+/// queue, announce `PeerConnected`, and spawn its per-peer outbound pump and
+/// inbound reader.
 fn register_peer(
-    conns: &ConnMap,
+    peer_senders: &PeerSenders,
     peer: PeerId,
     conn: Connection,
     inbound_tx: &mpsc::UnboundedSender<NetEvent>,
     reset: &Arc<ResetState>,
 ) {
-    conns
-        .lock()
-        .expect("conns mutex")
-        .insert(peer, conn.clone());
+    let (tx, rx) = mpsc::channel::<NetSend>(PER_PEER_OUTBOUND_QUEUE);
+    peer_senders.lock().expect("peer_senders").insert(peer, tx);
     let _ = inbound_tx.send(NetEvent::PeerConnected { peer });
+    // Outbound: drain this peer's queue onto its QUIC streams.
+    tokio::spawn(peer_pump(conn.clone(), rx, inbound_tx.clone()));
+    // Inbound: read this peer's streams; deregisters the peer on connection loss.
     spawn_conn_reader(
         conn,
         peer,
-        Arc::clone(conns),
+        Arc::clone(peer_senders),
         inbound_tx.clone(),
         Arc::clone(reset),
     );
@@ -327,59 +372,27 @@ struct PeerStreams {
     sess: HashMap<(String, String), SendStream>,
 }
 
-/// Drains queued `NetSend`s onto per-protocol QUIC uni streams.
-async fn outbound_pump(
-    mut outbound_rx: mpsc::UnboundedReceiver<NetSend>,
-    conns: ConnMap,
+/// One per connection: drains that peer's bounded queue onto its QUIC uni
+/// streams. Owning the [`PeerStreams`] here (rather than a shared map) keeps a
+/// slow peer's writes from blocking any other peer's pump. The pump exits when
+/// the queue closes (peer deregistered) or a write fails; the inbound reader
+/// owns disconnect reporting.
+async fn peer_pump(
+    conn: Connection,
+    mut rx: mpsc::Receiver<NetSend>,
     inbound_tx: mpsc::UnboundedSender<NetEvent>,
-    reset: Arc<ResetState>,
 ) {
-    let mut peers: HashMap<PeerId, PeerStreams> = HashMap::new();
-    while let Some(msg) = outbound_rx.recv().await {
-        // Local reconstruct: record the session and wake inbound SESS readers
-        // so each issues STOP_SENDING(0x01) to its upstream sender.
-        if let NetSend::SessionReconstructed {
-            channel,
-            message_id,
-        } = msg
-        {
-            reset.record((channel, message_id));
-            continue;
+    let mut streams = PeerStreams::default();
+    while let Some(msg) = rx.recv().await {
+        if let Err(e) = write_outbound(&conn, &mut streams, &msg, &inbound_tx).await {
+            // A single stream failing (e.g. a SESS `Stopped(0x01)` after the
+            // peer reconstructed) must not tear down the whole peer: drop the
+            // stream state so streams reopen on next use, and keep pumping. If
+            // the connection itself is gone every write errors cheaply until
+            // the reader deregisters the peer, closing this queue.
+            tracing::debug!(?e, "outbound write failed; resetting peer streams");
+            streams = PeerStreams::default();
         }
-        let Some(dst) = dest_peer(&msg) else { continue };
-        let Some(conn) = conns.lock().expect("conns mutex").get(&dst).cloned() else {
-            report_chunk_failure(&inbound_tx, &msg);
-            continue;
-        };
-        let streams = peers.entry(dst).or_default();
-        if let Err(e) = write_outbound(&conn, streams, &msg, &inbound_tx).await {
-            tracing::warn!(
-                ?e,
-                peer = dst,
-                "outbound write failed; resetting peer streams"
-            );
-            peers.remove(&dst);
-        }
-    }
-}
-
-/// If `msg` is a chunk, report it as failed so the engine can refund/re-plan.
-fn report_chunk_failure(inbound_tx: &mpsc::UnboundedSender<NetEvent>, msg: &NetSend) {
-    if let NetSend::Chunk {
-        peer,
-        channel,
-        message_id,
-        token,
-        ..
-    } = msg
-    {
-        let _ = inbound_tx.send(NetEvent::ChunkSendResult {
-            peer: *peer,
-            channel: channel.clone(),
-            message_id: message_id.clone(),
-            token: *token,
-            ok: false,
-        });
     }
 }
 
@@ -574,19 +587,21 @@ fn spawn_sess_reset_watcher(
 }
 
 /// Accept every inbound uni stream on `conn`; on connection loss emit
-/// `PeerDisconnected` and deregister the peer.
+/// `PeerDisconnected` and deregister the peer (dropping its outbound sender,
+/// which stops the peer pump).
 fn spawn_conn_reader(
     conn: Connection,
     peer: PeerId,
-    conns: ConnMap,
+    peer_senders: PeerSenders,
     inbound_tx: mpsc::UnboundedSender<NetEvent>,
     reset: Arc<ResetState>,
 ) {
     tokio::spawn(async move {
         loop {
             let Ok(recv) = conn.accept_uni().await else {
-                // Connection lost: report the disconnect once and stop reading.
-                conns.lock().expect("conns mutex").remove(&peer);
+                // Connection lost: deregister (closing the peer pump's queue)
+                // and report the disconnect once.
+                peer_senders.lock().expect("peer_senders").remove(&peer);
                 let _ = inbound_tx.send(NetEvent::PeerDisconnected { peer });
                 return;
             };
