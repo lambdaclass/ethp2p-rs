@@ -37,10 +37,19 @@
 //! and reroutes it, and retries a control frame on its next drain. The inbound
 //! event queue is currently unbounded.
 //!
+//! ## Peer-id pinning (opt-in hardening)
+//!
+//! By default (and for every accepted connection) the handshake `peer_id` is
+//! self-asserted, per the reference. [`QuicNet::connect_expecting`] additionally
+//! **pins** the expected identity of a dialed peer: a handshake asserting a
+//! different `peer_id` closes the connection (surfacing `PeerDisconnected`)
+//! rather than delivering a spoofed `Handshake`. This is a purely local check —
+//! wire-compatible, no protocol change.
+//!
 //! ## Deferred to later slices
 //!
-//! - **Hardening.** Peer authentication / SPKI pinning is the security slice;
-//!   the inbound event queue is not yet bounded.
+//! - **Hardening.** SPKI pinning / a persistent identity key, and bounding the
+//!   inbound event queue, remain.
 
 #![allow(clippy::module_name_repetitions)]
 
@@ -160,6 +169,10 @@ const MAX_CONCURRENT_UNI_STREAMS: u32 = 4096;
 /// bursts never fill it.
 const PER_PEER_OUTBOUND_QUEUE: usize = 256;
 
+/// QUIC application close code used when a peer dialed via
+/// [`QuicNet::connect_expecting`] asserts an identity other than the pinned one.
+const PEER_ID_MISMATCH_CLOSE: u32 = 0x02;
+
 /// Routing table: local peer id → the sender half of that peer's bounded
 /// outbound queue. Populated on connect/accept, removed on disconnect; also
 /// serves as the "is this peer connected" registry.
@@ -233,7 +246,10 @@ impl QuicNet {
                     match incoming.await {
                         Ok(conn) => {
                             let peer = next_peer_id.fetch_add(1, Ordering::Relaxed);
-                            register_peer(&peer_senders, peer, conn, &inbound_tx, &reset);
+                            // Accepted connections have no pinned identity (we do
+                            // not know who is dialing); the reference's
+                            // self-asserted model applies.
+                            register_peer(&peer_senders, peer, conn, &inbound_tx, &reset, None);
                         }
                         Err(e) => tracing::debug!(?e, "inbound connection failed"),
                     }
@@ -260,6 +276,27 @@ impl QuicNet {
     /// engine drives the handshake in response to the emitted
     /// [`NetEvent::PeerConnected`].
     pub async fn connect(&self, addr: SocketAddr) -> io::Result<PeerId> {
+        self.dial(addr, None).await
+    }
+
+    /// Like [`Self::connect`], but **pins** the peer's expected wire identity:
+    /// if the inbound BCAST handshake asserts a `peer_id` other than
+    /// `expected_peer_id`, the connection is closed and a
+    /// [`NetEvent::PeerDisconnected`] is emitted instead of a `Handshake`.
+    ///
+    /// This is the transport's peer-id-pinning hardening (off by default — plain
+    /// `connect` and all accepted connections keep the reference's self-asserted
+    /// identity model). Use it when dialing a peer whose identity is known in
+    /// advance; it is wire-compatible (a purely local check, no protocol change).
+    pub async fn connect_expecting(
+        &self,
+        addr: SocketAddr,
+        expected_peer_id: String,
+    ) -> io::Result<PeerId> {
+        self.dial(addr, Some(expected_peer_id)).await
+    }
+
+    async fn dial(&self, addr: SocketAddr, expected: Option<String>) -> io::Result<PeerId> {
         let connecting = self
             .endpoint
             .connect(addr, "localhost")
@@ -272,6 +309,7 @@ impl QuicNet {
             conn,
             &self.inbound_tx,
             &self.reset,
+            expected.map(Arc::from),
         );
         Ok(peer)
     }
@@ -336,6 +374,7 @@ fn register_peer(
     conn: Connection,
     inbound_tx: &mpsc::UnboundedSender<NetEvent>,
     reset: &Arc<ResetState>,
+    expected_peer_id: Option<Arc<str>>,
 ) {
     let (tx, rx) = mpsc::channel::<NetSend>(PER_PEER_OUTBOUND_QUEUE);
     peer_senders.lock().expect("peer_senders").insert(peer, tx);
@@ -349,6 +388,7 @@ fn register_peer(
         Arc::clone(peer_senders),
         inbound_tx.clone(),
         Arc::clone(reset),
+        expected_peer_id,
     );
 }
 
@@ -595,6 +635,7 @@ fn spawn_conn_reader(
     peer_senders: PeerSenders,
     inbound_tx: mpsc::UnboundedSender<NetEvent>,
     reset: Arc<ResetState>,
+    expected_peer_id: Option<Arc<str>>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -607,8 +648,12 @@ fn spawn_conn_reader(
             };
             let tx = inbound_tx.clone();
             let reset = Arc::clone(&reset);
+            let conn = conn.clone();
+            let expected = expected_peer_id.clone();
             tokio::spawn(async move {
-                if let Err(e) = read_stream(recv, peer, &tx, &reset).await {
+                if let Err(e) =
+                    read_stream(recv, peer, &tx, &reset, &conn, expected.as_deref()).await
+                {
                     tracing::debug!(?e, peer, "inbound stream ended with error");
                 }
             });
@@ -623,11 +668,33 @@ async fn read_stream(
     peer: PeerId,
     inbound_tx: &mpsc::UnboundedSender<NetEvent>,
     reset: &ResetState,
+    conn: &Connection,
+    expected_peer_id: Option<&str>,
 ) -> io::Result<()> {
     match read_selector(&mut recv).await? {
         Protocol::Bcast => {
             // Long-lived: read framed Bcast messages until the stream ends.
             while let Some(frame) = read_frame_opt::<Bcast>(&mut recv).await? {
+                // Peer-id pinning: a dialed-with-`connect_expecting` peer whose
+                // handshake asserts a different identity is rejected — close the
+                // connection (the reader loop then emits PeerDisconnected) and
+                // never surface the spoofed Handshake to the engine.
+                if let (Some(expected), Some(bcast::Message::PeerHandshake(h))) =
+                    (expected_peer_id, frame.message.as_ref())
+                {
+                    if h.peer_id != expected {
+                        tracing::warn!(
+                            expected,
+                            got = %h.peer_id,
+                            "ethp2p: peer id mismatch; closing connection"
+                        );
+                        conn.close(
+                            VarInt::from_u32(PEER_ID_MISMATCH_CLOSE),
+                            b"peer id mismatch",
+                        );
+                        break;
+                    }
+                }
                 let Some(event) = bcast_event(peer, frame) else {
                     continue;
                 };
