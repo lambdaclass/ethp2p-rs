@@ -613,6 +613,9 @@ where
                 }
             }
 
+            // Set if any send fails synchronously this round: we then stop
+            // draining rather than re-poll, so the engine yields.
+            let mut stalled = false;
             for d in work.dispatches {
                 let chunk_id: u32 = d.chunk_id;
                 let token = d.handle;
@@ -628,27 +631,35 @@ where
                     payload: d.payload,
                     token,
                 });
-                match result {
-                    // The chunk entered the transport. Defer the ack: its
-                    // honest outcome arrives later as `ChunkSendResult`
-                    // carrying `token`, at which point we call `chunk_sent`.
-                    Ok(()) => {
-                        self.pending_sends
-                            .insert((channel_id.clone(), message_id.clone(), token), d.peer);
+                if result.is_ok() {
+                    // The chunk entered the transport. Defer the ack: its honest
+                    // outcome arrives later as `ChunkSendResult` carrying
+                    // `token`, at which point we call `chunk_sent`.
+                    self.pending_sends
+                        .insert((channel_id.clone(), message_id.clone(), token), d.peer);
+                } else {
+                    // The send never reached the wire (peer's queue full →
+                    // Backpressure, or peer gone). Refund the in-flight
+                    // allocation so the shard is re-planned.
+                    if let Some(session) = self
+                        .channels
+                        .get_mut(channel_id)
+                        .and_then(|c| c.session_mut(message_id))
+                    {
+                        session.chunk_sent(d.peer, d.handle, false);
                     }
-                    // The send never reached the wire (peer unknown, queue
-                    // full). Resolve the in-flight allocation as failed now
-                    // so the strategy refunds and re-plans.
-                    Err(_) => {
-                        if let Some(session) = self
-                            .channels
-                            .get_mut(channel_id)
-                            .and_then(|c| c.session_mut(message_id))
-                        {
-                            session.chunk_sent(d.peer, d.handle, false);
-                        }
-                    }
+                    stalled = true;
                 }
+            }
+            // A synchronous send failure means the peer cannot take more right
+            // now. Re-polling would re-plan the just-refunded shard and re-send
+            // it to the same full queue in a tight loop, spinning the engine
+            // without ever yielding to the transport pump that drains it. Stop
+            // draining this round instead; the refunded shard is retried on the
+            // next drain, which the pending chunks trigger as they ack (there is
+            // always at least one, since the queue must fill before it rejects).
+            if stalled {
+                return Ok(());
             }
         }
     }
