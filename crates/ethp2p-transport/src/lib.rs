@@ -1,155 +1,269 @@
-//! Direct-on-QUIC transport for ethp2p — **demo / proof-of-concept.**
+//! Spec-conformant QUIC transport for ethp2p erasure-coded broadcast.
 //!
-//! This crate implements [`QuicNet`], a [`Net`](ethp2p_broadcast::runtime::Net)
-//! that carries the broadcast engine's traffic over real QUIC streams
-//! (via `quinn`, the dependency chosen in `port-decisions.md`). It lets
-//! the unchanged slice-0–6 engine + Reed-Solomon strategy run between two
-//! nodes over an actual UDP/QUIC connection — see `examples/quic_broadcast.rs`.
+//! Implements [`QuicNet`], a [`Net`](ethp2p_broadcast::runtime::Net) that
+//! carries the broadcast engine over the reference wire (specs 002/003):
+//! QUIC + TLS 1.3, ALPN `eth-ec-broadcast`, and **per-protocol
+//! unidirectional streams**, each opened with a single [`Protocol`] selector
+//! byte (via the slice-1 codec):
 //!
-//! # This is NOT the ratified slice 7
+//! - **BCAST** (selector `1`): one long-lived uni stream per direction
+//!   carrying `Bcast` handshake / subscribe / unsubscribe frames.
+//! - **SESS** (selector `2`): one uni stream per `(channel, message_id)`
+//!   session — a `Sess.Open` frame then zero or more `Sess.Update`s.
+//! - **CHUNK** (selector `3`): one ephemeral uni stream per chunk — a framed
+//!   `Chunk.Header` then exactly `data_length` raw payload bytes.
 //!
-//! The spec-conformant transport (`port-transport-quic`) is gated on the
-//! upstream Go spec extensions (varint protocol-ID registry, stream-manager
-//! priorities, fallback handshake) that are still "MISSING from design
-//! doc." Those gaps are precisely the *stream lifecycle* this demo has to
-//! invent. So the wire framing here is a **provisional, Rust-native** choice
-//! made only to get a runnable demo; it is not spec-conformant and makes no
-//! interop or bit-compat claim. The message *bodies*, however, are the real
-//! `Bcast`/`Sess`/`Chunk` protobuf frames from the slice-1 codec.
+//! Frames use the 4-byte big-endian length prefix from
+//! [`wire`](ethp2p_broadcast::wire); peer identity is the self-asserted
+//! `peer_id` string in the BCAST handshake (the reference specifies no
+//! TLS-identity binding). Internally each connection is assigned a local
+//! `u64` [`PeerId`]; the engine routes by that id.
 //!
-//! ## Demo wire framing
+//! ## Reconstruct reset (spec 002 §5)
 //!
-//! One unidirectional QUIC stream per sender→receiver direction carries an
-//! ordered sequence of records (QUIC preserves in-stream order, which the
-//! engine relies on for "session open before its chunks"):
+//! When this node reconstructs a message its engine emits
+//! [`NetSend::SessionReconstructed`]; the transport then issues
+//! `STOP_SENDING(0x01)` on every *inbound* SESS stream for that session,
+//! telling upstream senders we are done. A sender observes the stop on its
+//! *outbound* SESS stream and emits [`NetEvent::PeerReconstructed`] (code
+//! `0x01`) or [`NetEvent::SessionClosed`] (any other stop code); the engine
+//! detaches that peer from the session so no further chunks are planned to it.
 //!
-//! ```text
-//! uni stream := u64 sender_peer_id (LE)   // once, at stream open
-//!               record*
-//! record     := u8 kind
-//!               1 Handshake    : framed(Bcast{PeerHandshake})
-//!               2 Subscribe    : framed(Bcast{ChannelSubscribe})
-//!               3 Unsubscribe  : framed(Bcast{ChannelUnsubscribe})
-//!               4 SessionOpen  : framed(Sess{SessionOpen})
-//!               5 RoutingUpdate: str(channel) str(message_id) framed(Sess{RoutingUpdate})
-//!               6 Chunk        : framed(Chunk.Header) then data_length raw bytes
-//! ```
+//! ## Backpressure
 //!
-//! `framed(..)` is the slice-1 length-delimited protobuf framing
-//! ([`wire::write_framed`](ethp2p_broadcast::wire)); `str(s)` is a u32-LE
-//! length prefix followed by UTF-8 bytes. The `RoutingUpdate` body
-//! (`Sess.Update`) carries no channel/message-id, so the demo prefixes
-//! them — exactly the kind of stream-context decision the real spec must
-//! pin down.
+//! Each peer has its own bounded outbound queue drained by a dedicated pump, so
+//! one slow peer never head-of-line-blocks the others. When a queue is full,
+//! [`Net::send`] returns [`NetError::Backpressure`]: the engine refunds a chunk
+//! and reroutes it, and retries a control frame on its next drain. The inbound
+//! event queue is currently unbounded.
 //!
-//! # Demo limitations (deliberately out of scope)
+//! ## Peer-id pinning (opt-in hardening)
 //!
-//! These are fine for a short-lived two-node demo but must be addressed by
-//! the real slice-7 transport:
+//! By default (and for every accepted connection) the handshake `peer_id` is
+//! self-asserted, per the reference. [`QuicNet::connect_expecting`] additionally
+//! **pins** the expected identity of a dialed peer: a handshake asserting a
+//! different `peer_id` closes the connection (surfacing `PeerDisconnected`)
+//! rather than delivering a spoofed `Handshake`. This is a purely local check —
+//! wire-compatible, no protocol change.
 //!
-//! - **No peer authentication.** A connection is registered under the
-//!   peer id the remote *asserts* in its stream preface; there is no
-//!   binding between that id and the TLS identity, and the client skips
-//!   certificate verification entirely (see [`tls`]).
-//! - **No connection lifecycle.** Spawned accept/reader tasks run until the
-//!   process exits; dropping [`QuicNet`] does not close the endpoint, and
-//!   dead peers are never evicted. [`NetEvent::PeerDisconnected`] is never
-//!   emitted, so the engine is not told when a peer drops.
-//! - **Fire-and-forget send.** [`Net::send`] is synchronous and returns
-//!   before the async write happens; if a write later fails the message is
-//!   dropped (logged, not surfaced) — the trait cannot report it.
-//! - **No backpressure or flow-control tuning, retries, or 0-RTT.**
+//! ## Deferred to later slices
+//!
+//! - **Hardening.** SPKI pinning / a persistent identity key, and bounding the
+//!   inbound event queue, remain.
 
 #![allow(clippy::module_name_repetitions)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use ethp2p_broadcast::pb::{rs::ChunkIdent, Bcast, Sess};
+use ethp2p_broadcast::chunk::{read_chunk_stream, write_chunk};
+use ethp2p_broadcast::pb::{bcast, chunk, rs::ChunkIdent, sess, Bcast, Sess};
+use ethp2p_broadcast::protocol_pb::Protocol;
 use ethp2p_broadcast::runtime::{Net, NetError, NetEvent, NetSend};
+use ethp2p_broadcast::selector::{open_stream, read_selector};
 use ethp2p_broadcast::strategy::PeerId;
 use ethp2p_broadcast::wire::{read_framed, write_framed};
 use futures::stream::Stream;
 use prost::Message as _;
-use quinn::{Connection, Endpoint, RecvStream, SendStream};
-use tokio::sync::mpsc;
+use quinn::{Connection, Endpoint, RecvStream, SendStream, VarInt};
+use tokio::io::AsyncReadExt;
+use tokio::sync::{mpsc, Notify};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
+pub mod config;
 mod tls;
 
-const KIND_HANDSHAKE: u8 = 1;
-const KIND_SUBSCRIBE: u8 = 2;
-const KIND_UNSUBSCRIBE: u8 = 3;
-const KIND_SESSION_OPEN: u8 = 4;
-const KIND_ROUTING_UPDATE: u8 = 5;
-const KIND_CHUNK: u8 = 6;
+pub use config::QuicNetConfig;
 
-/// Upper bound on a length-prefixed string read from the wire.
-const MAX_STR_BYTES: usize = 64 * 1024;
-/// Upper bound on a chunk payload read from the wire.
-const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
-/// How long the outbound pump waits for a peer's connection to register
-/// before dropping a queued message.
-const CONN_WAIT: Duration = Duration::from_secs(10);
+/// Upper bound on reconstructed-session keys tracked for the reset (spec 002
+/// §5). Each entry lets a *late* inbound SESS stream for an already-done
+/// message be reset; the engine's tombstone independently ignores such
+/// traffic, so on overflow we evict the *oldest* key (bounding memory) rather
+/// than grow without limit — never the just-recorded key a live reader is
+/// waiting on.
+const MAX_RECONSTRUCTED_TRACKED: usize = 8192;
 
-type ConnMap = Arc<Mutex<HashMap<PeerId, Connection>>>;
+/// Insertion-ordered bounded set of reconstructed `(channel, message_id)`
+/// keys. FIFO eviction guarantees a freshly recorded key is never dropped
+/// before its inbound readers observe it.
+#[derive(Default)]
+struct ReconstructedTracker {
+    set: HashSet<(String, String)>,
+    order: VecDeque<(String, String)>,
+}
 
-/// A [`Net`] backed by real QUIC connections.
-#[derive(Debug)]
+/// Shared reconstruct-reset state. When this node's engine reconstructs a
+/// message it emits [`NetSend::SessionReconstructed`]; the pump records the
+/// `(channel, message_id)` here and wakes every inbound SESS reader, which
+/// then issues `STOP_SENDING(0x01)` to its upstream sender (telling that peer
+/// we are done). The sender observes the stop as [`NetEvent::PeerReconstructed`].
+#[derive(Default)]
+struct ResetState {
+    reconstructed: Mutex<ReconstructedTracker>,
+    notify: Notify,
+}
+
+impl ResetState {
+    /// Record a reconstructed session and wake inbound SESS readers.
+    fn record(&self, key: (String, String)) {
+        {
+            let mut t = self.reconstructed.lock().expect("reset mutex");
+            if t.set.insert(key.clone()) {
+                t.order.push_back(key);
+                // Bound memory by evicting oldest-first; the newest key (just
+                // pushed) is never the one removed, so a reader woken for it
+                // still finds it on re-check.
+                while t.order.len() > MAX_RECONSTRUCTED_TRACKED {
+                    if let Some(old) = t.order.pop_front() {
+                        t.set.remove(&old);
+                    }
+                }
+            }
+        }
+        self.notify.notify_waiters();
+    }
+
+    fn is_reconstructed(&self, key: &(String, String)) -> bool {
+        self.reconstructed
+            .lock()
+            .expect("reset mutex")
+            .set
+            .contains(key)
+    }
+
+    /// Resolve once `key`'s session has been reconstructed. Never resolves
+    /// while `key` is `None` (the caller gates this branch on a known session).
+    async fn wait_reconstructed(&self, key: Option<&(String, String)>) {
+        let Some(k) = key else {
+            return std::future::pending().await;
+        };
+        loop {
+            // Register for the wake before checking, so a `record` between the
+            // check and the await is not missed (mirrors quinn's own pattern).
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_reconstructed(k) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Uni-stream credit advertised to each peer. Every chunk rides its own
+/// unidirectional stream, so a broadcast burst opens many at once; ample
+/// credit keeps the sender's pump from blocking in `open_uni` (which would
+/// stall the ack-gated drain) while the receiver drains earlier chunk streams.
+const MAX_CONCURRENT_UNI_STREAMS: u32 = 4096;
+
+/// Depth of each peer's bounded outbound queue. A full queue means that peer's
+/// pump is not keeping up: a `Chunk` then fails with [`NetError::Backpressure`]
+/// so the strategy reroutes, and (rare) control frames are likewise refused and
+/// retried on the engine's next drain. Per-peer queues also stop one slow peer
+/// from head-of-line-blocking sends to the others. Sized so ordinary broadcast
+/// bursts never fill it.
+const PER_PEER_OUTBOUND_QUEUE: usize = 256;
+
+/// QUIC application close code used when a peer dialed via
+/// [`QuicNet::connect_expecting`] asserts an identity other than the pinned one.
+const PEER_ID_MISMATCH_CLOSE: u32 = 0x02;
+
+/// Routing table: local peer id → the sender half of that peer's bounded
+/// outbound queue. Populated on connect/accept, removed on disconnect; also
+/// serves as the "is this peer connected" registry.
+type PeerSenders = Arc<Mutex<HashMap<PeerId, mpsc::Sender<NetSend>>>>;
+
+/// A [`Net`] backed by real QUIC connections speaking the ethp2p spec wire.
 pub struct QuicNet {
-    local_peer: PeerId,
     endpoint: Endpoint,
-    outbound_tx: mpsc::UnboundedSender<NetSend>,
     inbound_tx: mpsc::UnboundedSender<NetEvent>,
     inbound_rx: Mutex<Option<mpsc::UnboundedReceiver<NetEvent>>>,
-    conns: ConnMap,
+    peer_senders: PeerSenders,
+    next_peer_id: Arc<AtomicU64>,
+    reset: Arc<ResetState>,
+}
+
+impl std::fmt::Debug for QuicNet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuicNet")
+            .field("local_addr", &self.endpoint.local_addr().ok())
+            .finish_non_exhaustive()
+    }
 }
 
 impl QuicNet {
-    /// Bind a QUIC endpoint on `bind_addr` under identity `local_peer`.
-    ///
-    /// Spawns the accept loop (inbound connections) and the outbound pump
-    /// (drains `send` calls onto QUIC streams).
-    pub fn bind(local_peer: PeerId, bind_addr: SocketAddr) -> io::Result<Self> {
-        let mut endpoint = Endpoint::server(tls::server_config()?, bind_addr)?;
-        endpoint.set_default_client_config(tls::client_config()?);
+    /// Bind a QUIC endpoint on `bind_addr` with default config.
+    pub fn bind(bind_addr: SocketAddr) -> io::Result<Self> {
+        Self::bind_with_config(bind_addr, QuicNetConfig::default())
+    }
 
-        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<NetSend>();
+    /// [`Self::bind`] with explicit transport configuration (ALPN, QUIC idle
+    /// timeout and keep-alive).
+    pub fn bind_with_config(bind_addr: SocketAddr, config: QuicNetConfig) -> io::Result<Self> {
+        let QuicNetConfig {
+            alpn,
+            max_idle_timeout,
+            keep_alive_interval,
+        } = config;
+        // Shared QUIC transport config: keep-alive under the idle timeout so a
+        // silent-but-live connection stays up while a vanished peer is detected
+        // promptly.
+        let transport = {
+            let mut t = quinn::TransportConfig::default();
+            let idle = quinn::IdleTimeout::try_from(max_idle_timeout).map_err(io::Error::other)?;
+            t.max_idle_timeout(Some(idle));
+            t.keep_alive_interval(Some(keep_alive_interval));
+            t.max_concurrent_uni_streams(MAX_CONCURRENT_UNI_STREAMS.into());
+            Arc::new(t)
+        };
+        let mut server = tls::server_config(&alpn)?;
+        server.transport_config(Arc::clone(&transport));
+        let mut endpoint = Endpoint::server(server, bind_addr)?;
+        let mut client = tls::client_config(&alpn)?;
+        client.transport_config(transport);
+        endpoint.set_default_client_config(client);
+
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<NetEvent>();
-        let conns: ConnMap = Arc::new(Mutex::new(HashMap::new()));
+        let peer_senders: PeerSenders = Arc::new(Mutex::new(HashMap::new()));
+        let next_peer_id = Arc::new(AtomicU64::new(1));
+        let reset = Arc::new(ResetState::default());
 
-        // Accept loop: register and read every inbound connection.
+        // Accept loop: assign each inbound connection a local peer id, then
+        // spawn its per-peer outbound pump and inbound reader.
         {
             let endpoint = endpoint.clone();
-            let conns = Arc::clone(&conns);
+            let peer_senders = Arc::clone(&peer_senders);
             let inbound_tx = inbound_tx.clone();
+            let next_peer_id = Arc::clone(&next_peer_id);
+            let reset = Arc::clone(&reset);
             tokio::spawn(async move {
                 while let Some(incoming) = endpoint.accept().await {
                     match incoming.await {
-                        Ok(conn) => spawn_conn_reader(conn, Arc::clone(&conns), inbound_tx.clone()),
+                        Ok(conn) => {
+                            let peer = next_peer_id.fetch_add(1, Ordering::Relaxed);
+                            // Accepted connections have no pinned identity (we do
+                            // not know who is dialing); the reference's
+                            // self-asserted model applies.
+                            register_peer(&peer_senders, peer, conn, &inbound_tx, &reset, None);
+                        }
                         Err(e) => tracing::debug!(?e, "inbound connection failed"),
                     }
                 }
             });
         }
 
-        // Outbound pump.
-        {
-            let conns = Arc::clone(&conns);
-            tokio::spawn(outbound_pump(local_peer, outbound_rx, conns));
-        }
-
         Ok(Self {
-            local_peer,
             endpoint,
-            outbound_tx,
             inbound_tx,
             inbound_rx: Mutex::new(Some(inbound_rx)),
-            conns,
+            peer_senders,
+            next_peer_id,
+            reset,
         })
     }
 
@@ -158,33 +272,86 @@ impl QuicNet {
         self.endpoint.local_addr()
     }
 
-    /// The peer identity this endpoint sends under.
-    #[must_use]
-    pub fn local_peer(&self) -> PeerId {
-        self.local_peer
+    /// Dial `addr`, assign the connection a local peer id, and return it. The
+    /// engine drives the handshake in response to the emitted
+    /// [`NetEvent::PeerConnected`].
+    pub async fn connect(&self, addr: SocketAddr) -> io::Result<PeerId> {
+        self.dial(addr, None).await
     }
 
-    /// Dial `remote` at `addr` and register the connection so the engine
-    /// can immediately send to it. Idempotent per peer.
-    pub async fn connect(&self, remote: PeerId, addr: SocketAddr) -> io::Result<()> {
+    /// Like [`Self::connect`], but **pins** the peer's expected wire identity:
+    /// if the inbound BCAST handshake asserts a `peer_id` other than
+    /// `expected_peer_id`, the connection is closed and a
+    /// [`NetEvent::PeerDisconnected`] is emitted instead of a `Handshake`.
+    ///
+    /// This is the transport's peer-id-pinning hardening (off by default — plain
+    /// `connect` and all accepted connections keep the reference's self-asserted
+    /// identity model). Use it when dialing a peer whose identity is known in
+    /// advance; it is wire-compatible (a purely local check, no protocol change).
+    pub async fn connect_expecting(
+        &self,
+        addr: SocketAddr,
+        expected_peer_id: String,
+    ) -> io::Result<PeerId> {
+        self.dial(addr, Some(expected_peer_id)).await
+    }
+
+    async fn dial(&self, addr: SocketAddr, expected: Option<String>) -> io::Result<PeerId> {
         let connecting = self
             .endpoint
             .connect(addr, "localhost")
             .map_err(io::Error::other)?;
         let conn = connecting.await.map_err(io::Error::other)?;
-        self.conns
-            .lock()
-            .expect("conns mutex")
-            .insert(remote, conn.clone());
-        // Also read anything the remote sends back on this connection.
-        spawn_conn_reader(conn, Arc::clone(&self.conns), self.inbound_tx.clone());
-        Ok(())
+        let peer = self.next_peer_id.fetch_add(1, Ordering::Relaxed);
+        register_peer(
+            &self.peer_senders,
+            peer,
+            conn,
+            &self.inbound_tx,
+            &self.reset,
+            expected.map(Arc::from),
+        );
+        Ok(peer)
+    }
+
+    /// Close the endpoint and all connections.
+    pub fn close(&self) {
+        self.endpoint.close(0_u32.into(), b"shutdown");
     }
 }
 
 impl Net for QuicNet {
     fn send(&self, msg: NetSend) -> Result<(), NetError> {
-        self.outbound_tx.send(msg).map_err(|_| NetError::Closed)
+        // Local reconstruct: record + wake inbound SESS readers, no peer route.
+        if let NetSend::SessionReconstructed {
+            channel,
+            message_id,
+        } = msg
+        {
+            self.reset.record((channel, message_id));
+            return Ok(());
+        }
+        let Some(dst) = dest_peer(&msg) else {
+            return Ok(());
+        };
+        let sender = self
+            .peer_senders
+            .lock()
+            .expect("peer_senders")
+            .get(&dst)
+            .cloned();
+        let Some(sender) = sender else {
+            return Err(NetError::PeerNotFound(dst));
+        };
+        // Non-blocking enqueue onto the peer's bounded queue. A full queue is
+        // backpressure — the engine refunds a chunk and reroutes, or retries a
+        // control frame on its next drain; a closed queue means the peer's pump
+        // has stopped (disconnect in flight).
+        match sender.try_send(msg) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(NetError::Backpressure(dst)),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(NetError::PeerNotFound(dst)),
+        }
     }
 
     fn events(&self) -> Pin<Box<dyn Stream<Item = NetEvent> + Send + 'static>> {
@@ -198,129 +365,85 @@ impl Net for QuicNet {
     }
 }
 
-fn dest_peer(msg: &NetSend) -> PeerId {
+/// Register a freshly established connection: create its bounded outbound
+/// queue, announce `PeerConnected`, and spawn its per-peer outbound pump and
+/// inbound reader.
+fn register_peer(
+    peer_senders: &PeerSenders,
+    peer: PeerId,
+    conn: Connection,
+    inbound_tx: &mpsc::UnboundedSender<NetEvent>,
+    reset: &Arc<ResetState>,
+    expected_peer_id: Option<Arc<str>>,
+) {
+    let (tx, rx) = mpsc::channel::<NetSend>(PER_PEER_OUTBOUND_QUEUE);
+    peer_senders.lock().expect("peer_senders").insert(peer, tx);
+    let _ = inbound_tx.send(NetEvent::PeerConnected { peer });
+    // Outbound: drain this peer's queue onto its QUIC streams.
+    tokio::spawn(peer_pump(conn.clone(), rx, inbound_tx.clone()));
+    // Inbound: read this peer's streams; deregisters the peer on connection loss.
+    spawn_conn_reader(
+        conn,
+        peer,
+        Arc::clone(peer_senders),
+        inbound_tx.clone(),
+        Arc::clone(reset),
+        expected_peer_id,
+    );
+}
+
+fn dest_peer(msg: &NetSend) -> Option<PeerId> {
     match msg {
         NetSend::Handshake { peer, .. }
         | NetSend::Subscribe { peer, .. }
         | NetSend::Unsubscribe { peer, .. }
         | NetSend::SessionOpen { peer, .. }
         | NetSend::RoutingUpdate { peer, .. }
-        | NetSend::Chunk { peer, .. } => *peer,
+        | NetSend::Chunk { peer, .. } => Some(*peer),
+        // SessionReconstructed has no destination (it resets inbound streams).
+        _ => None,
     }
 }
 
-/// Drains queued `NetSend`s onto per-peer QUIC uni streams, preserving
-/// per-peer order.
-// `map_entry`: the check and insert straddle async work (`open_uni`, preface
-// write) and an early `continue` on failure, which the entry API can't model.
-#[allow(clippy::map_entry)]
-async fn outbound_pump(
-    local_peer: PeerId,
-    mut outbound_rx: mpsc::UnboundedReceiver<NetSend>,
-    conns: ConnMap,
-) {
-    let mut streams: HashMap<PeerId, SendStream> = HashMap::new();
-    while let Some(msg) = outbound_rx.recv().await {
-        let dst = dest_peer(&msg);
-        if !streams.contains_key(&dst) {
-            let Some(conn) = wait_for_conn(&conns, dst).await else {
-                tracing::warn!(peer = dst, "no connection registered; dropping message");
-                continue;
-            };
-            match conn.open_uni().await {
-                Ok(mut stream) => {
-                    if let Err(e) = stream.write_all(&local_peer.to_le_bytes()).await {
-                        tracing::warn!(?e, peer = dst, "failed to write stream preface");
-                        continue;
-                    }
-                    streams.insert(dst, stream);
-                }
-                Err(e) => {
-                    tracing::warn!(?e, peer = dst, "failed to open uni stream");
-                    continue;
-                }
-            }
-        }
-        let stream = streams.get_mut(&dst).expect("stream present");
-        if let Err(e) = write_record(stream, &msg).await {
-            tracing::warn!(?e, peer = dst, "failed to write record; resetting stream");
-            streams.remove(&dst);
-        }
-    }
+/// Per-peer outbound stream state.
+#[derive(Default)]
+struct PeerStreams {
+    ctrl: Option<SendStream>,
+    sess: HashMap<(String, String), SendStream>,
 }
 
-/// Poll the connection registry until `peer` is present (set by `connect`
-/// on the dialer side, or by the stream reader once the peer's preface
-/// arrives), up to [`CONN_WAIT`].
-async fn wait_for_conn(conns: &ConnMap, peer: PeerId) -> Option<Connection> {
-    let mut waited = Duration::ZERO;
-    let step = Duration::from_millis(20);
-    loop {
-        if let Some(conn) = conns.lock().expect("conns mutex").get(&peer).cloned() {
-            return Some(conn);
-        }
-        if waited >= CONN_WAIT {
-            return None;
-        }
-        tokio::time::sleep(step).await;
-        waited += step;
-    }
-}
-
-/// Accept every inbound uni stream on `conn` and read records from it.
-fn spawn_conn_reader(
+/// One per connection: drains that peer's bounded queue onto its QUIC uni
+/// streams. Owning the [`PeerStreams`] here (rather than a shared map) keeps a
+/// slow peer's writes from blocking any other peer's pump. The pump exits when
+/// the queue closes (peer deregistered) or a write fails; the inbound reader
+/// owns disconnect reporting.
+async fn peer_pump(
     conn: Connection,
-    conns: ConnMap,
+    mut rx: mpsc::Receiver<NetSend>,
     inbound_tx: mpsc::UnboundedSender<NetEvent>,
 ) {
-    tokio::spawn(async move {
-        loop {
-            match conn.accept_uni().await {
-                Ok(recv) => {
-                    let conns = Arc::clone(&conns);
-                    let conn = conn.clone();
-                    let inbound_tx = inbound_tx.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = read_stream(recv, conn, conns, inbound_tx).await {
-                            tracing::debug!(?e, "stream reader ended");
-                        }
-                    });
-                }
-                Err(e) => {
-                    tracing::debug!(?e, "connection closed");
-                    return;
-                }
-            }
-        }
-    });
-}
-
-/// Read the sender preface, register the connection under the sender's
-/// peer id, then read records until EOF.
-async fn read_stream(
-    mut recv: RecvStream,
-    conn: Connection,
-    conns: ConnMap,
-    inbound_tx: mpsc::UnboundedSender<NetEvent>,
-) -> io::Result<()> {
-    let mut id_buf = [0_u8; 8];
-    recv.read_exact(&mut id_buf)
-        .await
-        .map_err(io::Error::other)?;
-    let sender = PeerId::from_le_bytes(id_buf);
-    conns.lock().expect("conns mutex").insert(sender, conn);
-
-    while let Some(event) = read_record(&mut recv, sender).await? {
-        if inbound_tx.send(event).is_err() {
-            break; // receiver dropped
+    let mut streams = PeerStreams::default();
+    while let Some(msg) = rx.recv().await {
+        if let Err(e) = write_outbound(&conn, &mut streams, &msg, &inbound_tx).await {
+            // A single stream failing (e.g. a SESS `Stopped(0x01)` after the
+            // peer reconstructed) must not tear down the whole peer: drop the
+            // stream state so streams reopen on next use, and keep pumping. If
+            // the connection itself is gone every write errors cheaply until
+            // the reader deregisters the peer, closing this queue.
+            tracing::debug!(?e, "outbound write failed; resetting peer streams");
+            streams = PeerStreams::default();
         }
     }
-    Ok(())
 }
 
-// One arm per `NetSend` variant; the encoding is inherently flat and long.
+/// Write one outbound message on the appropriate per-protocol stream.
 #[allow(clippy::too_many_lines)]
-async fn write_record(stream: &mut SendStream, msg: &NetSend) -> io::Result<()> {
+async fn write_outbound(
+    conn: &Connection,
+    streams: &mut PeerStreams,
+    msg: &NetSend,
+    inbound_tx: &mpsc::UnboundedSender<NetEvent>,
+) -> io::Result<()> {
     match msg {
         NetSend::Handshake {
             version,
@@ -328,59 +451,63 @@ async fn write_record(stream: &mut SendStream, msg: &NetSend) -> io::Result<()> 
             peer_id,
             ..
         } => {
-            stream.write_all(&[KIND_HANDSHAKE]).await?;
             let frame = Bcast {
-                message: Some(ethp2p_broadcast::pb::bcast::Message::PeerHandshake(
-                    ethp2p_broadcast::pb::bcast::Handshake {
-                        version: *version,
-                        channels: channels.clone(),
-                        peer_id: peer_id.clone(),
-                    },
-                )),
+                message: Some(bcast::Message::PeerHandshake(bcast::Handshake {
+                    version: *version,
+                    channels: channels.clone(),
+                    peer_id: peer_id.clone(),
+                })),
             };
-            write_framed(stream, &frame).await?;
+            write_framed(ensure_ctrl(conn, streams).await?, &frame).await?;
         }
         NetSend::Subscribe { channel, .. } => {
-            stream.write_all(&[KIND_SUBSCRIBE]).await?;
             let frame = Bcast {
-                message: Some(ethp2p_broadcast::pb::bcast::Message::ChannelSubscribe(
-                    ethp2p_broadcast::pb::bcast::Subscribe {
-                        channel: channel.clone(),
-                    },
-                )),
+                message: Some(bcast::Message::ChannelSubscribe(bcast::Subscribe {
+                    channel: channel.clone(),
+                })),
             };
-            write_framed(stream, &frame).await?;
+            write_framed(ensure_ctrl(conn, streams).await?, &frame).await?;
         }
         NetSend::Unsubscribe { channel, .. } => {
-            stream.write_all(&[KIND_UNSUBSCRIBE]).await?;
             let frame = Bcast {
-                message: Some(ethp2p_broadcast::pb::bcast::Message::ChannelUnsubscribe(
-                    ethp2p_broadcast::pb::bcast::Unsubscribe {
-                        channel: channel.clone(),
-                    },
-                )),
+                message: Some(bcast::Message::ChannelUnsubscribe(bcast::Unsubscribe {
+                    channel: channel.clone(),
+                })),
             };
-            write_framed(stream, &frame).await?;
+            write_framed(ensure_ctrl(conn, streams).await?, &frame).await?;
         }
         NetSend::SessionOpen {
+            peer,
             channel,
             message_id,
             preamble,
             initial_update,
-            ..
         } => {
-            stream.write_all(&[KIND_SESSION_OPEN]).await?;
+            let mut stream = conn.open_uni().await.map_err(io::Error::other)?;
+            open_stream(&mut stream, Protocol::Sess).await?;
             let frame = Sess {
-                frame: Some(ethp2p_broadcast::pb::sess::Frame::SessionOpen(
-                    ethp2p_broadcast::pb::sess::Open {
-                        channel: channel.clone(),
-                        message_id: message_id.clone(),
-                        preamble: preamble.clone(),
-                        initial_update: initial_update.clone(),
-                    },
-                )),
+                frame: Some(sess::Frame::SessionOpen(sess::Open {
+                    channel: channel.clone(),
+                    message_id: message_id.clone(),
+                    preamble: preamble.clone(),
+                    initial_update: initial_update.clone(),
+                })),
             };
-            write_framed(stream, &frame).await?;
+            write_framed(&mut stream, &frame).await?;
+            // Watch for the receiver's STOP_SENDING: 0x01 means it reconstructed
+            // the message (PeerReconstructed), any other code means it left the
+            // session (SessionClosed). The future is `'static`, so it does not
+            // borrow the SendStream the pump keeps for routing updates.
+            spawn_sess_reset_watcher(
+                &stream,
+                *peer,
+                channel.clone(),
+                message_id.clone(),
+                inbound_tx,
+            );
+            streams
+                .sess
+                .insert((channel.clone(), message_id.clone()), stream);
         }
         NetSend::RoutingUpdate {
             channel,
@@ -388,170 +515,284 @@ async fn write_record(stream: &mut SendStream, msg: &NetSend) -> io::Result<()> 
             payload,
             ..
         } => {
-            stream.write_all(&[KIND_ROUTING_UPDATE]).await?;
-            write_str(stream, channel).await?;
-            write_str(stream, message_id).await?;
-            let frame = Sess {
-                frame: Some(ethp2p_broadcast::pb::sess::Frame::RoutingUpdate(
-                    ethp2p_broadcast::pb::sess::Update {
+            let key = (channel.clone(), message_id.clone());
+            if let Some(stream) = streams.sess.get_mut(&key) {
+                let frame = Sess {
+                    frame: Some(sess::Frame::RoutingUpdate(sess::Update {
                         data: payload.clone(),
-                    },
-                )),
-            };
-            write_framed(stream, &frame).await?;
+                    })),
+                };
+                write_framed(stream, &frame).await?;
+            } else {
+                tracing::debug!(%channel, %message_id, "routing update with no open SESS stream");
+            }
         }
         NetSend::Chunk {
+            peer,
             channel,
             message_id,
             chunk_id,
             payload,
-            ..
+            token,
         } => {
-            stream.write_all(&[KIND_CHUNK]).await?;
-            let header = ethp2p_broadcast::pb::chunk::Header {
+            // A chunk failure must not disturb the peer's other streams; it is
+            // reported via ChunkSendResult, never propagated to the pump.
+            let ok = send_chunk(conn, channel, message_id, *chunk_id, payload)
+                .await
+                .is_ok();
+            let _ = inbound_tx.send(NetEvent::ChunkSendResult {
+                peer: *peer,
                 channel: channel.clone(),
                 message_id: message_id.clone(),
-                chunk_id: ChunkIdent {
-                    index: i32::try_from(*chunk_id).unwrap_or(i32::MAX),
-                }
-                .encode_to_vec(),
-                data_length: u32::try_from(payload.len()).unwrap_or(u32::MAX),
-            };
-            write_framed(stream, &header).await?;
-            stream.write_all(payload).await?;
+                token: *token,
+                ok,
+            });
         }
+        // SessionReconstructed (reset-0x01) is filtered by the pump before it
+        // reaches here; the wildcard also absorbs future non_exhaustive variants.
+        _ => {}
     }
     Ok(())
 }
 
-// One arm per record kind; the decode is inherently flat and long.
-#[allow(clippy::too_many_lines)]
-async fn read_record(recv: &mut RecvStream, sender: PeerId) -> io::Result<Option<NetEvent>> {
-    let mut kind = [0_u8; 1];
-    match recv.read_exact(&mut kind).await {
-        Ok(()) => {}
-        // Clean end of stream at a record boundary: the sender finished and
-        // dropped it. Any other read error is a real failure.
-        Err(quinn::ReadExactError::FinishedEarly(..)) => return Ok(None),
-        Err(e) => return Err(io::Error::other(e)),
+/// Open the long-lived BCAST stream on first use.
+async fn ensure_ctrl<'a>(
+    conn: &Connection,
+    streams: &'a mut PeerStreams,
+) -> io::Result<&'a mut SendStream> {
+    if streams.ctrl.is_none() {
+        let mut stream = conn.open_uni().await.map_err(io::Error::other)?;
+        open_stream(&mut stream, Protocol::Bcast).await?;
+        streams.ctrl = Some(stream);
     }
-    let event = match kind[0] {
-        KIND_HANDSHAKE => {
-            let frame: Bcast = read_framed(recv).await?;
-            match frame.message {
-                Some(ethp2p_broadcast::pb::bcast::Message::PeerHandshake(h)) => {
-                    NetEvent::Handshake {
-                        peer: sender,
-                        version: h.version,
-                        channels: h.channels,
-                        peer_id: h.peer_id,
+    Ok(streams.ctrl.as_mut().expect("ctrl just set"))
+}
+
+/// Open an ephemeral CHUNK stream, write the chunk, and finish it.
+async fn send_chunk(
+    conn: &Connection,
+    channel: &str,
+    message_id: &str,
+    chunk_id: u32,
+    payload: &[u8],
+) -> io::Result<()> {
+    let header = chunk::Header {
+        channel: channel.to_string(),
+        message_id: message_id.to_string(),
+        chunk_id: ChunkIdent {
+            index: i32::try_from(chunk_id).unwrap_or(i32::MAX),
+        }
+        .encode_to_vec(),
+        data_length: u32::try_from(payload.len()).unwrap_or(u32::MAX),
+    };
+    let mut stream = conn.open_uni().await.map_err(io::Error::other)?;
+    write_chunk(&mut stream, &header, payload).await?;
+    stream.finish().map_err(io::Error::other)?;
+    Ok(())
+}
+
+/// Watch an outbound SESS stream for the receiver's `STOP_SENDING`. Code
+/// `0x01` (reconstructed) → [`NetEvent::PeerReconstructed`]; any other code →
+/// [`NetEvent::SessionClosed`]. `Ok(None)` (our own finish) and connection
+/// errors — the latter already surfaced as `PeerDisconnected` — emit nothing.
+/// [`SendStream::stopped`] yields a `'static` future, so this does not borrow
+/// the stream the pump keeps for writes.
+fn spawn_sess_reset_watcher(
+    stream: &SendStream,
+    peer: PeerId,
+    channel: String,
+    message_id: String,
+    inbound_tx: &mpsc::UnboundedSender<NetEvent>,
+) {
+    let stopped = stream.stopped();
+    let tx = inbound_tx.clone();
+    tokio::spawn(async move {
+        if let Ok(Some(code)) = stopped.await {
+            let event = if code == VarInt::from_u32(config::ERR_RECONSTRUCTED) {
+                NetEvent::PeerReconstructed {
+                    peer,
+                    channel,
+                    message_id,
+                }
+            } else {
+                NetEvent::SessionClosed {
+                    peer,
+                    channel,
+                    message_id,
+                }
+            };
+            let _ = tx.send(event);
+        }
+    });
+}
+
+/// Accept every inbound uni stream on `conn`; on connection loss emit
+/// `PeerDisconnected` and deregister the peer (dropping its outbound sender,
+/// which stops the peer pump).
+fn spawn_conn_reader(
+    conn: Connection,
+    peer: PeerId,
+    peer_senders: PeerSenders,
+    inbound_tx: mpsc::UnboundedSender<NetEvent>,
+    reset: Arc<ResetState>,
+    expected_peer_id: Option<Arc<str>>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let Ok(recv) = conn.accept_uni().await else {
+                // Connection lost: deregister (closing the peer pump's queue)
+                // and report the disconnect once.
+                peer_senders.lock().expect("peer_senders").remove(&peer);
+                let _ = inbound_tx.send(NetEvent::PeerDisconnected { peer });
+                return;
+            };
+            let tx = inbound_tx.clone();
+            let reset = Arc::clone(&reset);
+            let conn = conn.clone();
+            let expected = expected_peer_id.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    read_stream(recv, peer, &tx, &reset, &conn, expected.as_deref()).await
+                {
+                    tracing::debug!(?e, peer, "inbound stream ended with error");
+                }
+            });
+        }
+    });
+}
+
+/// Read a single inbound uni stream: dispatch by its selector byte and emit
+/// the decoded events tagged with `peer`.
+async fn read_stream(
+    mut recv: RecvStream,
+    peer: PeerId,
+    inbound_tx: &mpsc::UnboundedSender<NetEvent>,
+    reset: &ResetState,
+    conn: &Connection,
+    expected_peer_id: Option<&str>,
+) -> io::Result<()> {
+    match read_selector(&mut recv).await? {
+        Protocol::Bcast => {
+            // Long-lived: read framed Bcast messages until the stream ends.
+            while let Some(frame) = read_frame_opt::<Bcast>(&mut recv).await? {
+                // Peer-id pinning: a dialed-with-`connect_expecting` peer whose
+                // handshake asserts a different identity is rejected — close the
+                // connection (the reader loop then emits PeerDisconnected) and
+                // never surface the spoofed Handshake to the engine.
+                if let (Some(expected), Some(bcast::Message::PeerHandshake(h))) =
+                    (expected_peer_id, frame.message.as_ref())
+                {
+                    if h.peer_id != expected {
+                        tracing::warn!(
+                            expected,
+                            got = %h.peer_id,
+                            "ethp2p: peer id mismatch; closing connection"
+                        );
+                        conn.close(
+                            VarInt::from_u32(PEER_ID_MISMATCH_CLOSE),
+                            b"peer id mismatch",
+                        );
+                        break;
                     }
                 }
-                other => return Err(invalid(format!("expected handshake, got {other:?}"))),
+                let Some(event) = bcast_event(peer, frame) else {
+                    continue;
+                };
+                if inbound_tx.send(event).is_err() {
+                    break;
+                }
             }
         }
-        KIND_SUBSCRIBE => {
-            let frame: Bcast = read_framed(recv).await?;
-            match frame.message {
-                Some(ethp2p_broadcast::pb::bcast::Message::ChannelSubscribe(s)) => {
-                    NetEvent::Subscribe {
-                        peer: sender,
-                        channel: s.channel,
+        Protocol::Sess => {
+            // Read frames until EOF, but once we learn this stream's session
+            // key also watch for a local reconstruct: when it fires, we are
+            // done receiving, so STOP_SENDING(0x01) tells the sender to stop.
+            let mut key: Option<(String, String)> = None;
+            loop {
+                tokio::select! {
+                    frame = read_frame_opt::<Sess>(&mut recv) => {
+                        let Some(frame) = frame? else { break };
+                        let Some(event) = sess_event(peer, frame) else { continue };
+                        if let NetEvent::SessionOpen { channel, message_id, .. } = &event {
+                            key = Some((channel.clone(), message_id.clone()));
+                        }
+                        if inbound_tx.send(event).is_err() {
+                            break;
+                        }
+                    }
+                    () = reset.wait_reconstructed(key.as_ref()), if key.is_some() => {
+                        let _ = recv.stop(VarInt::from_u32(config::ERR_RECONSTRUCTED));
+                        break;
                     }
                 }
-                other => return Err(invalid(format!("expected subscribe, got {other:?}"))),
             }
         }
-        KIND_UNSUBSCRIBE => {
-            let frame: Bcast = read_framed(recv).await?;
-            match frame.message {
-                Some(ethp2p_broadcast::pb::bcast::Message::ChannelUnsubscribe(u)) => {
-                    NetEvent::Unsubscribe {
-                        peer: sender,
-                        channel: u.channel,
-                    }
-                }
-                other => return Err(invalid(format!("expected unsubscribe, got {other:?}"))),
-            }
-        }
-        KIND_SESSION_OPEN => {
-            let frame: Sess = read_framed(recv).await?;
-            match frame.frame {
-                Some(ethp2p_broadcast::pb::sess::Frame::SessionOpen(o)) => NetEvent::SessionOpen {
-                    peer: sender,
-                    channel: o.channel,
-                    message_id: o.message_id,
-                    preamble: o.preamble,
-                    initial_update: o.initial_update,
-                },
-                other => return Err(invalid(format!("expected session open, got {other:?}"))),
-            }
-        }
-        KIND_ROUTING_UPDATE => {
-            let channel = read_str(recv).await?;
-            let message_id = read_str(recv).await?;
-            let frame: Sess = read_framed(recv).await?;
-            match frame.frame {
-                Some(ethp2p_broadcast::pb::sess::Frame::RoutingUpdate(u)) => {
-                    NetEvent::RoutingUpdate {
-                        peer: sender,
-                        channel,
-                        message_id,
-                        payload: u.data,
-                    }
-                }
-                other => return Err(invalid(format!("expected routing update, got {other:?}"))),
-            }
-        }
-        KIND_CHUNK => {
-            let header: ethp2p_broadcast::pb::chunk::Header = read_framed(recv).await?;
-            let ident = ChunkIdent::decode(header.chunk_id.as_slice())
-                .map_err(|e| invalid(format!("bad chunk_id: {e}")))?;
-            let chunk_id = u32::try_from(ident.index)
-                .map_err(|_| invalid(format!("negative chunk index {}", ident.index)))?;
-            let len = header.data_length as usize;
-            if len > MAX_CHUNK_BYTES {
-                return Err(invalid(format!("chunk too large: {len}")));
-            }
-            let mut payload = vec![0_u8; len];
-            recv.read_exact(&mut payload)
-                .await
-                .map_err(io::Error::other)?;
-            NetEvent::Chunk {
-                peer: sender,
+        Protocol::Chunk => {
+            let (header, mut reader) = read_chunk_stream(recv).await?;
+            let ident = ChunkIdent::decode(header.chunk_id.as_slice()).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("chunk_id: {e}"))
+            })?;
+            let chunk_id = u32::try_from(ident.index).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("negative chunk index {}", ident.index),
+                )
+            })?;
+            let mut payload = Vec::new();
+            reader.read_to_end(&mut payload).await?;
+            let _ = inbound_tx.send(NetEvent::Chunk {
+                peer,
                 channel: header.channel,
                 message_id: header.message_id,
                 chunk_id,
                 payload,
-            }
+            });
         }
-        other => return Err(invalid(format!("unknown record kind {other}"))),
-    };
-    Ok(Some(event))
-}
-
-async fn write_str(stream: &mut SendStream, s: &str) -> io::Result<()> {
-    let bytes = s.as_bytes();
-    let len = u32::try_from(bytes.len()).map_err(|_| invalid("string too long".into()))?;
-    stream.write_all(&len.to_le_bytes()).await?;
-    stream.write_all(bytes).await?;
+        Protocol::Unspecified => {}
+    }
     Ok(())
 }
 
-async fn read_str(recv: &mut RecvStream) -> io::Result<String> {
-    let mut len_buf = [0_u8; 4];
-    recv.read_exact(&mut len_buf)
-        .await
-        .map_err(io::Error::other)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > MAX_STR_BYTES {
-        return Err(invalid(format!("string too long: {len}")));
+/// Read one framed protobuf, mapping a clean end-of-stream to `None`.
+async fn read_frame_opt<M: prost::Message + Default>(
+    recv: &mut RecvStream,
+) -> io::Result<Option<M>> {
+    match read_framed::<_, M>(recv).await {
+        Ok(m) => Ok(Some(m)),
+        // A clean finish (or truncation) at a frame boundary ends the stream.
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(e),
     }
-    let mut buf = vec![0_u8; len];
-    recv.read_exact(&mut buf).await.map_err(io::Error::other)?;
-    String::from_utf8(buf).map_err(|e| invalid(format!("invalid utf-8: {e}")))
 }
 
-fn invalid(msg: String) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, msg)
+fn bcast_event(peer: PeerId, frame: Bcast) -> Option<NetEvent> {
+    match frame.message? {
+        bcast::Message::PeerHandshake(h) => Some(NetEvent::Handshake {
+            peer,
+            version: h.version,
+            channels: h.channels,
+            peer_id: h.peer_id,
+        }),
+        bcast::Message::ChannelSubscribe(s) => Some(NetEvent::Subscribe {
+            peer,
+            channel: s.channel,
+        }),
+        bcast::Message::ChannelUnsubscribe(u) => Some(NetEvent::Unsubscribe {
+            peer,
+            channel: u.channel,
+        }),
+    }
+}
+
+fn sess_event(peer: PeerId, frame: Sess) -> Option<NetEvent> {
+    match frame.frame? {
+        sess::Frame::SessionOpen(o) => Some(NetEvent::SessionOpen {
+            peer,
+            channel: o.channel,
+            message_id: o.message_id,
+            preamble: o.preamble,
+            initial_update: o.initial_update,
+        }),
+        sess::Frame::RoutingUpdate(_u) => None,
+    }
 }

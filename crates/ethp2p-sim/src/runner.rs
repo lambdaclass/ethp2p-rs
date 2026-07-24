@@ -12,9 +12,12 @@
 #![allow(clippy::missing_fields_in_debug)]
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
-use ethp2p_broadcast::engine::{rs_relay_factory_seeded, DeliveredMessage, Engine, StepResult};
+use ethp2p_broadcast::engine::{
+    rs_relay_factory_seeded, DeliveredMessage, Engine, EngineConfig, StepResult,
+};
 use ethp2p_broadcast::strategy::config::RsConfig;
 use ethp2p_broadcast::strategy::rs::encode::encode as rs_encode;
 use ethp2p_broadcast::strategy::rs::state::RsStrategy;
@@ -102,7 +105,18 @@ impl SimRunner {
         for &peer in peers {
             let endpoint = hub.endpoint(peer);
             let (tx, rx) = mpsc::channel(DELIVERY_SINK_CAPACITY);
-            engines.insert(peer, Engine::new(peer, endpoint, tx));
+            // Drive session ageing from the sim's virtual clock so cleanup is
+            // deterministic (with default TTLs it never fires in short runs).
+            engines.insert(
+                peer,
+                Engine::with_config(
+                    peer,
+                    endpoint,
+                    tx,
+                    EngineConfig::default(),
+                    Arc::new(hub.clock()),
+                ),
+            );
             delivered.insert(peer, rx);
         }
         let rt = tokio::runtime::Builder::new_current_thread()

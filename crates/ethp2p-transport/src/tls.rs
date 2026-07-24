@@ -1,9 +1,12 @@
-//! Demo TLS setup for the QUIC endpoints.
+//! TLS setup for the QUIC endpoints.
 //!
-//! Self-signed server cert + a client that skips certificate verification.
-//! This is **demo-only**: a real deployment needs proper peer
-//! authentication (the spec's transport identity model, still unspecified).
-//! Uses the `ring` rustls backend per the `port-decisions.md` Decision log.
+//! Replicates the reference's transport-security posture: a freshly generated
+//! self-signed server cert and a client that skips certificate verification.
+//! Peer identity is the self-asserted `peer_id` string in the BCAST handshake,
+//! not the TLS identity — the reference specifies no cert/identity binding, so
+//! this is spec-conformant, not a shortcut. Verifying/pinning is the
+//! config-gated hardening added in a later slice. Uses the `ring` rustls
+//! backend per the `port-decisions.md` Decision log.
 
 use std::io;
 use std::sync::{Arc, Once};
@@ -15,8 +18,6 @@ use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvi
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 
-const ALPN: &[u8] = b"ethp2p-demo";
-
 /// Install the ring crypto provider as the process default (once).
 fn install_provider() {
     static ONCE: Once = Once::new();
@@ -25,8 +26,9 @@ fn install_provider() {
     });
 }
 
-/// Server config with a freshly generated self-signed `localhost` cert.
-pub fn server_config() -> io::Result<ServerConfig> {
+/// Server config with a freshly generated self-signed `localhost` cert,
+/// offering `alpn`.
+pub fn server_config(alpn: &[u8]) -> io::Result<ServerConfig> {
     install_provider();
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
         .map_err(io::Error::other)?;
@@ -37,20 +39,21 @@ pub fn server_config() -> io::Result<ServerConfig> {
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key)
         .map_err(io::Error::other)?;
-    crypto.alpn_protocols = vec![ALPN.to_vec()];
+    crypto.alpn_protocols = vec![alpn.to_vec()];
 
     let quic = QuicServerConfig::try_from(crypto).map_err(io::Error::other)?;
     Ok(ServerConfig::with_crypto(Arc::new(quic)))
 }
 
-/// Client config that accepts any server certificate (demo only).
-pub fn client_config() -> io::Result<ClientConfig> {
+/// Client config that accepts any server certificate (per the spec's identity
+/// model), requiring `alpn`.
+pub fn client_config(alpn: &[u8]) -> io::Result<ClientConfig> {
     install_provider();
     let mut crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(SkipServerVerification::new())
         .with_no_client_auth();
-    crypto.alpn_protocols = vec![ALPN.to_vec()];
+    crypto.alpn_protocols = vec![alpn.to_vec()];
 
     let quic = QuicClientConfig::try_from(crypto).map_err(io::Error::other)?;
     Ok(ClientConfig::new(Arc::new(quic)))

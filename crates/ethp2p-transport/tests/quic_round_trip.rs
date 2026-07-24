@@ -17,8 +17,10 @@ use ethp2p_transport::QuicNet;
 use prost::Message as _;
 use tokio::sync::mpsc;
 
-const ORIGIN_PEER: u64 = 1;
-const RELAY_PEER: u64 = 2;
+// Engine-local identities (the `peer-N` handshake string + logging). Distinct
+// from the transport's minted per-connection ids, which start at 1.
+const ORIGIN_SELF: u64 = 100;
+const RELAY_SELF: u64 = 200;
 const CHANNEL: &str = "test";
 const MESSAGE_ID: &str = "msg-0001";
 
@@ -44,20 +46,20 @@ async fn origin_relay_round_trip_over_quic() {
     preamble.encode(&mut preamble_bytes).unwrap();
 
     let loopback = |port| SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let relay_net = QuicNet::bind(RELAY_PEER, loopback(0)).expect("bind relay");
+    let relay_net = QuicNet::bind(loopback(0)).expect("bind relay");
     let relay_addr = relay_net.local_addr().expect("relay addr");
-    let origin_net = QuicNet::bind(ORIGIN_PEER, loopback(0)).expect("bind origin");
+    let origin_net = QuicNet::bind(loopback(0)).expect("bind origin");
 
-    origin_net
-        .connect(RELAY_PEER, relay_addr)
-        .await
-        .expect("dial relay");
+    // Dial the relay; both endpoints mint a local peer id and emit
+    // `PeerConnected`, which drives each engine's handshake. No explicit
+    // `engine.connect` — the transport reports the connection.
+    origin_net.connect(relay_addr).await.expect("dial relay");
 
     let (origin_delivered_tx, _origin_rx) = mpsc::channel(8);
     let (relay_delivered_tx, mut relay_delivered_rx) = mpsc::channel(8);
 
-    let mut origin = Engine::new(ORIGIN_PEER, origin_net, origin_delivered_tx);
-    let mut relay = Engine::new(RELAY_PEER, relay_net, relay_delivered_tx);
+    let mut origin = Engine::new(ORIGIN_SELF, origin_net, origin_delivered_tx);
+    let mut relay = Engine::new(RELAY_SELF, relay_net, relay_delivered_tx);
 
     origin
         .subscribe(CHANNEL.into(), rs_relay_factory(config))
@@ -65,8 +67,6 @@ async fn origin_relay_round_trip_over_quic() {
     relay
         .subscribe(CHANNEL.into(), rs_relay_factory(config))
         .unwrap();
-    origin.connect(RELAY_PEER).unwrap();
-    relay.connect(ORIGIN_PEER).unwrap();
 
     let driver = async {
         let mut published = false;

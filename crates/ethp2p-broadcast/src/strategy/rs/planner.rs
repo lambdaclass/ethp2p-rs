@@ -63,8 +63,21 @@ struct PeerState {
 pub struct EmitPlanner {
     mode: PlannerMode,
     num_shards: u32,
+    /// Fibonacci tie-break seed, retained so refunded/re-opened shards
+    /// can be re-pushed with their original priority.
+    seed: u64,
     /// `BinaryHeap` provides max-heap; we wrap entries in `Reverse` to
     /// get min-heap behavior.
+    ///
+    /// The heap may hold more than one entry per shard: a [`refund`] (or a
+    /// fresh allocation) pushes a corrected entry and leaves the previous
+    /// one behind as a stale duplicate. [`allocate`] is the sole authority
+    /// on `allocation` and discards any popped entry whose `allocation`
+    /// disagrees with it (lazy invalidation), so exactly one live entry per
+    /// shard is ever acted on.
+    ///
+    /// [`refund`]: Self::refund_allocation
+    /// [`allocate`]: Self::allocate
     heap: BinaryHeap<Reverse<EmitEntry>>,
     allocation: BTreeMap<u32, u32>,
     sent_count: BTreeMap<u32, u32>,
@@ -87,6 +100,7 @@ impl EmitPlanner {
         Self {
             mode,
             num_shards,
+            seed,
             heap,
             allocation: BTreeMap::new(),
             sent_count: BTreeMap::new(),
@@ -115,6 +129,14 @@ impl EmitPlanner {
         let mut chosen: Option<EmitEntry> = None;
 
         while let Some(Reverse(entry)) = self.heap.pop() {
+            // Lazy invalidation: a shard's authoritative allocation lives in
+            // `self.allocation`. Entries left behind by a refund (or a prior
+            // allocate) carry a stale count; drop them so only the live entry
+            // is acted on.
+            let authoritative = self.allocation.get(&entry.idx).copied().unwrap_or(0);
+            if entry.allocation != authoritative {
+                continue;
+            }
             // Per-shard cap (relay mode only).
             if let Some(cap) = cap {
                 if entry.allocation >= cap {
@@ -182,6 +204,46 @@ impl EmitPlanner {
     pub fn cancel_in_flight(&mut self, peer: PeerId, idx: u32) {
         let s = self.peers.entry(peer).or_default();
         s.in_flight.remove(&idx);
+    }
+
+    /// Refund one allocation of shard `idx`: a send that never reached the
+    /// wire (a write failure, or an in-flight shard whose peer departed).
+    /// Lowers the shard's allocation count and re-opens it for allocation,
+    /// so a relay regains the `forward_multiplier` budget the failed send
+    /// would otherwise consume forever. A no-op when the count is already
+    /// zero. Callers pair this with [`cancel_in_flight`] to also clear the
+    /// in-flight marker.
+    ///
+    /// [`cancel_in_flight`]: Self::cancel_in_flight
+    pub fn refund_allocation(&mut self, idx: u32) {
+        let count = match self.allocation.get(&idx).copied() {
+            Some(c) if c > 0 => c,
+            _ => return,
+        };
+        let new_alloc = count - 1;
+        if new_alloc == 0 {
+            self.allocation.remove(&idx);
+        } else {
+            self.allocation.insert(idx, new_alloc);
+        }
+        // Push the corrected live entry; the higher-allocation entry left in
+        // the heap becomes stale and is discarded when `allocate` pops it.
+        self.heap.push(Reverse(EmitEntry {
+            allocation: new_alloc,
+            fib: fib_priority(self.seed, idx),
+            idx,
+        }));
+    }
+
+    /// Remove all planner state for `peer` (it disconnected). Every shard
+    /// still in-flight to it is refunded, since those sends can no longer
+    /// complete. Mirrors the reference's peer-departure handling.
+    pub fn remove_peer(&mut self, peer: PeerId) {
+        if let Some(state) = self.peers.remove(&peer) {
+            for idx in state.in_flight {
+                self.refund_allocation(idx);
+            }
+        }
     }
 
     /// Replace the peer's optimistic havelist (e.g., after merging an
@@ -311,6 +373,79 @@ mod tests {
         // Subsequent allocate for the same peer should skip `idx`.
         let next = p.allocate(peer).unwrap();
         assert_ne!(next, idx);
+    }
+
+    #[test]
+    fn refund_reopens_relay_budget() {
+        let mut p = EmitPlanner::new(
+            1,
+            0,
+            PlannerMode::Relay {
+                forward_multiplier: 1,
+            },
+        );
+        assert_eq!(p.allocate(1), Some(0));
+        assert_eq!(p.allocation_count(0), 1);
+        // Budget exhausted: a second peer gets nothing.
+        assert_eq!(p.allocate(2), None);
+        // A failed send refunds the allocation.
+        p.cancel_in_flight(1, 0);
+        p.refund_allocation(0);
+        assert_eq!(p.allocation_count(0), 0);
+        // The shard is allocatable again, and the count returns to the cap.
+        assert_eq!(p.allocate(2), Some(0));
+        assert_eq!(p.allocation_count(0), 1);
+    }
+
+    #[test]
+    fn refund_at_zero_is_noop() {
+        let mut p = EmitPlanner::new(2, 0, PlannerMode::Origin);
+        p.refund_allocation(0);
+        assert_eq!(p.allocation_count(0), 0);
+        assert!(p.allocate(1).is_some(), "planner still functional");
+    }
+
+    #[test]
+    fn remove_peer_refunds_in_flight() {
+        let mut p = EmitPlanner::new(
+            1,
+            0,
+            PlannerMode::Relay {
+                forward_multiplier: 1,
+            },
+        );
+        assert_eq!(p.allocate(1), Some(0));
+        assert_eq!(p.allocate(2), None, "budget used by peer 1");
+        p.remove_peer(1);
+        assert_eq!(p.allocation_count(0), 0, "in-flight shard refunded");
+        assert_eq!(p.allocate(2), Some(0), "freed budget re-usable");
+    }
+
+    #[test]
+    fn refund_realloc_cycles_respect_cap() {
+        let cap = 3;
+        let mut p = EmitPlanner::new(
+            4,
+            0x1234,
+            PlannerMode::Relay {
+                forward_multiplier: cap,
+            },
+        );
+        for round in 0..50_u64 {
+            if let Some(idx) = p.allocate(round % 7) {
+                assert!(p.allocation_count(idx) <= cap, "cap held during cycle");
+                if round % 2 == 0 {
+                    p.cancel_in_flight(round % 7, idx);
+                    p.refund_allocation(idx);
+                }
+            }
+        }
+        for idx in 0..4 {
+            assert!(
+                p.allocation_count(idx) <= cap,
+                "cap invariant for shard {idx}"
+            );
+        }
     }
 
     #[test]

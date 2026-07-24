@@ -40,6 +40,9 @@ pub(crate) fn destination(msg: &NetSend) -> PeerId {
         | NetSend::SessionOpen { peer, .. }
         | NetSend::RoutingUpdate { peer, .. }
         | NetSend::Chunk { peer, .. } => *peer,
+        // `NetSend` is non-exhaustive; the sim models only the six wire
+        // messages above. New variants must be handled explicitly.
+        other => unreachable!("sim destination: unhandled NetSend {other:?}"),
     }
 }
 
@@ -98,6 +101,7 @@ pub(crate) fn into_event(src: PeerId, msg: NetSend) -> NetEvent {
             chunk_id,
             payload,
         },
+        other => unreachable!("sim into_event: unhandled NetSend {other:?}"),
     }
 }
 
@@ -410,6 +414,7 @@ mod tests {
             message_id: "msg".into(),
             chunk_id,
             payload: vec![],
+            token: u64::from(chunk_id),
         }
     }
 

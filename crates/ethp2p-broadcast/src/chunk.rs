@@ -16,14 +16,29 @@ use crate::pb::chunk::Header;
 use crate::selector::open_stream;
 use crate::wire::{read_framed, write_framed};
 
+/// Maximum permitted CHUNK payload size, in bytes (reference
+/// `maxChunkDataSize`, 1 MiB). Independent of the framed-message cap in
+/// [`crate::wire`]: the payload rides raw, not as a length-prefixed frame.
+pub const MAX_CHUNK_DATA_BYTES: u32 = 1024 * 1024;
+
 /// Writes a complete CHUNK stream: selector, header, and payload bytes.
 ///
 /// Returns [`io::ErrorKind::InvalidInput`] if `payload.len()` does not
-/// match `header.data_length`.
+/// match `header.data_length`, or if the payload exceeds
+/// [`MAX_CHUNK_DATA_BYTES`].
 pub async fn write_chunk<W>(writer: &mut W, header: &Header, payload: &[u8]) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
+    if header.data_length > MAX_CHUNK_DATA_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "chunk payload too large: {} bytes (max {MAX_CHUNK_DATA_BYTES})",
+                header.data_length
+            ),
+        ));
+    }
     let declared = usize::try_from(header.data_length).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -49,14 +64,26 @@ where
 /// Reads the [`Header`] from an inbound CHUNK stream and returns a
 /// payload reader bounded to exactly `header.data_length` bytes.
 ///
-/// The selector frame must have been consumed by the caller first
+/// The selector byte must have been consumed by the caller first
 /// (typically via [`crate::selector::read_selector`]), since the
 /// dispatch layer needs the protocol identifier to route the stream.
+///
+/// Rejects a header whose `data_length` exceeds [`MAX_CHUNK_DATA_BYTES`]
+/// before any payload bytes are read.
 pub async fn read_chunk_stream<R>(mut reader: R) -> io::Result<(Header, ChunkPayloadReader<R>)>
 where
     R: AsyncRead + Unpin,
 {
     let header: Header = read_framed(&mut reader).await?;
+    if header.data_length > MAX_CHUNK_DATA_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "chunk payload too large: {} bytes (max {MAX_CHUNK_DATA_BYTES})",
+                header.data_length
+            ),
+        ));
+    }
     let remaining = u64::from(header.data_length);
     Ok((header, ChunkPayloadReader { reader, remaining }))
 }

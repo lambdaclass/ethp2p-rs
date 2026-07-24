@@ -154,6 +154,11 @@ impl SimState {
     /// Submit an outbound message: classify against the fault plan,
     /// record the trace entry, and (unless dropped) schedule delivery.
     pub(crate) fn submit_send(&mut self, src: PeerId, msg: NetSend) -> Result<(), NetError> {
+        // The sim does not model reconstruct-detach; the local reset command
+        // has no destination and is dropped.
+        if matches!(msg, NetSend::SessionReconstructed { .. }) {
+            return Ok(());
+        }
         let dst = destination(&msg);
         if !self.inboxes.contains_key(&dst) {
             return Err(NetError::PeerNotFound(dst));
